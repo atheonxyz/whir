@@ -306,10 +306,12 @@ where
             }
         }
 
+        let binary_folds = evaluation_point.len() - self.final_sumcheck.num_rounds;
         FinalClaim {
             evaluation_point,
             rlc_coefficients: initial_forms_rlc_coeffs.to_vec(),
             linear_form_rlc: M::Target::ZERO,
+            binary_folds,
         }
     }
 }

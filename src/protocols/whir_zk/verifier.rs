@@ -436,10 +436,15 @@ where
             rho: prepare.rho,
             alpha_coeffs: prepare.alpha_coeffs,
             dims: self.dims,
-            blinded_final_claim: whir::FinalClaim {
-                evaluation_point: ood.evaluation_point,
-                rlc_coefficients: ood.constraint_rlc_coeffs,
-                linear_form_rlc: ood.linear_form_rlc,
+            blinded_final_claim: {
+                let binary_folds = ood.evaluation_point.len()
+                    - self.config.blinded_polynomial.final_sumcheck.num_rounds;
+                whir::FinalClaim {
+                    evaluation_point: ood.evaluation_point,
+                    rlc_coefficients: ood.constraint_rlc_coeffs,
+                    linear_form_rlc: ood.linear_form_rlc,
+                    binary_folds,
+                }
             },
         })
     }

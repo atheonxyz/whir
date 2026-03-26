@@ -96,9 +96,14 @@ impl<F: FftField> Config<F> {
         (blinded_sec, blinding_sec)
     }
 
-    pub fn new(num_variables_main: usize, params: &ProtocolParameters) -> Self {
+    pub fn new(domain_size: usize, params: &ProtocolParameters) -> Self {
+        // zkWHIR 2.0 uses binary sumcheck and IRS-commit, which require a power-of-2
+        // witness domain.  Round up if the caller passed a smooth (non-power-of-2) size.
+        let domain_size = domain_size.next_power_of_two();
         let blinded_config: whir::Config<Identity<F>> =
-            whir::Config::new(1 << num_variables_main, params);
+            whir::Config::new(domain_size, params);
+        // μ = log₂(domain_size) (always exact since domain_size is now a power of 2).
+        let num_variables_main = blinded_config.initial_num_variables();
         let witness_sec = params.security_level.saturating_sub(params.pow_bits) as f64;
         let blinding_sec = params.security_level as f64;
 
@@ -125,16 +130,24 @@ impl<F: FftField> Config<F> {
 
         // ell = smallest integer such that 2^ell > q_ub
         let ell = (usize::BITS - q_ub.leading_zeros()) as usize;
-        assert!(
-            ell + 1 < num_variables_main,
-            "blinding variables ell+1={} must be < mu={num_variables_main}",
-            ell + 1
-        );
         debug_assert!(
             (1usize << ell) > q_ub,
             "2^ell ({}) must exceed q_ub ({q_ub})",
             1usize << ell
         );
+
+        // zkWHIR 2.0 requires ell + 1 < mu so that the blinding domain (2^(ell+1))
+        // is strictly smaller than the witness domain (2^mu).  If the requested
+        // domain is too small, expand by multiplying by a power of 2 to get enough
+        // trailing zeros.  Increasing mu reduces the query budget (more leakage),
+        // so ell is non-increasing after expansion — the recursion terminates.
+        if ell + 1 >= num_variables_main {
+            let need_trailing = ell + 2;
+            let current_trailing = domain_size.trailing_zeros() as usize;
+            let shift = need_trailing.saturating_sub(current_trailing);
+            let expanded_size = domain_size << shift;
+            return Self::new(expanded_size, params);
+        }
 
         // nu = ⌊mu/ell⌋ — number of blinding polynomials (alternative sampling)
         let nu = num_variables_main / ell;
@@ -287,7 +300,7 @@ mod tests {
             batch_size: 1,
             hash_id: hash::SHA2,
         };
-        let mut config = Config::new(TEST_NUM_VARIABLES, &whir_params);
+        let mut config = Config::new(TEST_NUM_COEFFS, &whir_params);
         config.disable_pow();
         config
     }
@@ -428,7 +441,7 @@ mod tests {
             batch_size,
             hash_id: hash::SHA2,
         };
-        let mut config = Config::new(TEST_NUM_VARIABLES, &whir_params);
+        let mut config = Config::new(TEST_NUM_COEFFS, &whir_params);
         config.disable_pow();
         config
     }

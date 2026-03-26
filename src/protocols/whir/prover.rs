@@ -278,13 +278,6 @@ where
             evaluation_point.extend(folding_randomness.0.iter().copied());
             debug_assert_eq!(dot(&vector, &covector), the_sum);
 
-            // Pad for smooth-domain polynomials (2^a * 3^b * 13^c) before final round.
-            let final_padded_size = self.final_sumcheck.initial_size;
-            vector.resize(final_padded_size, M::Target::ZERO);
-            if has_constraints {
-                covector.resize(final_padded_size, M::Target::ZERO);
-            }
-
             // Rounds 1..N + final round.
             let result = super::rounds::prove_remaining_rounds(
                 &self.round_configs,

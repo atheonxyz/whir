@@ -310,6 +310,13 @@ where
         prev_witness = witness;
     }
 
+    // Pad for smooth-domain polynomials (2^a * 3^b * 13^c) before final round.
+    // After all binary folds, current_size may be a non-power-of-2 smooth residual
+    // (e.g. 3×2^k) that the final sumcheck pads up to the next power of two.
+    let final_padded_size = final_config.sumcheck.initial_size;
+    state.vector.resize(final_padded_size, F::ZERO);
+    state.covector.resize(final_padded_size, F::ZERO);
+
     let last_rc = round_configs.last().unwrap();
     let (final_in_domain, final_folding) =
         prove_final_round(final_config, last_rc, prover_state, state, &prev_witness);

@@ -2,13 +2,13 @@ use ark_ff::{AdditiveGroup, Field};
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
-use super::{Commitment, Config};
+use super::{fold_based_mle_evaluate, Commitment, Config};
 use crate::{
     algebra::{
         dot,
         embedding::{Embedding, Identity},
         eq_weights,
-        linear_form::{Evaluate, LinearForm, MultilinearExtension},
+        linear_form::{Evaluate, MultilinearExtension},
         tensor_product,
     },
     hash::Hash,
@@ -236,8 +236,18 @@ impl<M: Embedding> Config<M> {
             .collect::<Vec<_>>();
 
         // Compute the claimed rlc of the linear form mles from the sumcheck invariant.
-        let poly_eval = MultilinearExtension::new(final_sumcheck_randomness)
-            .evaluate(&Identity::new(), &final_vector);
+        let poly_eval = if final_vector.len().is_power_of_two() {
+            MultilinearExtension::new(final_sumcheck_randomness)
+                .evaluate(&Identity::new(), &final_vector)
+        } else {
+            use crate::algebra::sumcheck::fold;
+            let mut v = final_vector.clone();
+            for &r in &final_sumcheck_randomness {
+                fold(&mut v, r);
+            }
+            debug_assert_eq!(v.len(), 1);
+            v[0]
+        };
         let mut linear_form_rlc = the_sum / poly_eval;
 
         // Subtract all internal linear forms.
@@ -246,9 +256,14 @@ impl<M: Embedding> Config<M> {
                 || self.initial_num_variables(),
                 |p| self.round_configs[p].initial_num_variables(),
             );
+            let round_size = round.checked_sub(1).map_or_else(
+                || self.initial_size(),
+                |p| self.round_configs[p].initial_size(),
+            );
             let start = evaluation_point.len().saturating_sub(num_variables);
             for (rlc_coeff, weights) in zip_strict(weights_rlc_coeffs, weights) {
-                linear_form_rlc -= rlc_coeff * weights.mle_evaluate(&evaluation_point[start..]);
+                let val = fold_based_mle_evaluate(&weights, &evaluation_point[start..], round_size);
+                linear_form_rlc -= rlc_coeff * val;
             }
         }
 

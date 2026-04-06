@@ -10,10 +10,7 @@ use serde::{Deserialize, Serialize};
 use spongefish::{Decoding, VerificationResult};
 
 use crate::{
-    algebra::{
-        dot, embedding::Identity, multilinear_extend, random_vector, scalar_mul_add_new,
-        univariate_evaluate,
-    },
+    algebra::{dot, embedding::Identity, random_vector, scalar_mul_add_new, univariate_evaluate},
     hash::Hash,
     protocols::{irs_commit, sumcheck},
     transcript::{
@@ -162,7 +159,15 @@ impl<F: Field> Config<F> {
                         * univariate_evaluate(&masks, point);
                 verify!(value == expected);
             }
-            let mle = multilinear_extend(&vector, &point);
+            let mle = {
+                use crate::algebra::sumcheck::fold;
+                let mut v = vector;
+                for &r in &point {
+                    fold(&mut v, r);
+                }
+                debug_assert_eq!(v.len(), 1);
+                v[0]
+            };
             verify!(!mle.is_zero());
             let linear_mle = sum / mle;
             return Ok((point, linear_mle));
@@ -195,7 +200,15 @@ impl<F: Field> Config<F> {
 
         // Compute implied MLE of the linear form
         // f*(r) · l(r) = sum  =>  l(r) = sum / f*(r)
-        let masked_mle = multilinear_extend(&masked_vector, &point);
+        let masked_mle = {
+            use crate::algebra::sumcheck::fold;
+            let mut v = masked_vector;
+            for &r in &point {
+                fold(&mut v, r);
+            }
+            debug_assert_eq!(v.len(), 1);
+            v[0]
+        };
         verify!(!masked_mle.is_zero());
         let linear_mle = masked_sum / masked_mle;
 
@@ -262,7 +275,15 @@ mod tests {
             covector.clone(),
             sum,
         );
-        assert_eq!(multilinear_extend(&covector, &point), value);
+        if config.size() > 0 {
+            use crate::algebra::sumcheck::fold;
+            let mut cv = covector.clone();
+            for &r in &point {
+                fold(&mut cv, r);
+            }
+            assert_eq!(cv.len(), 1);
+            assert_eq!(cv[0], value);
+        }
         let proof = prover_state.proof();
 
         // Verifier

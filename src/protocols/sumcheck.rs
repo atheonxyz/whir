@@ -23,6 +23,20 @@ use crate::{
     utils::chunks_exact_or_empty,
 };
 
+/// Compute the size of a vector after `rounds` of folding at `len/2`.
+///
+/// Each fold: `size → ceil(size / 2)`. For even sizes, exact halving.
+pub fn fold_n_times(initial_size: usize, rounds: usize) -> usize {
+    let mut size = initial_size;
+    for _ in 0..rounds {
+        if size <= 1 {
+            break;
+        }
+        size = (size + 1) / 2;
+    }
+    size
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct Config<F>
@@ -37,15 +51,11 @@ where
 }
 
 impl<F: Field> Config<F> {
+    /// Compute the vector size after `num_rounds` of folding at `len/2`.
+    ///
+    /// Each fold: `size → ceil(size / 2)`. For even sizes, exact halving.
     pub fn final_size(&self) -> usize {
-        assert!(
-            self.num_rounds == 0 || self.initial_size.next_power_of_two() >= 1 << self.num_rounds
-        );
-        if self.initial_size == 0 || self.num_rounds == 0 {
-            self.initial_size
-        } else {
-            self.initial_size.next_power_of_two() >> self.num_rounds
-        }
+        fold_n_times(self.initial_size, self.num_rounds)
     }
 
     /// Runs the quadratic sumcheck protocol as configured.
@@ -75,7 +85,10 @@ impl<F: Field> Config<F> {
         U64: Codec<[H::U]>,
     {
         assert!(
-            self.num_rounds == 0 || self.initial_size.next_power_of_two() >= 1 << self.num_rounds
+            self.num_rounds == 0 || self.final_size() >= 1,
+            "too many rounds ({}) for initial_size {}",
+            self.num_rounds,
+            self.initial_size,
         );
         assert!(self.mask_length == 0 || self.mask_length >= 3);
         assert_eq!(a.len(), self.initial_size);
@@ -168,7 +181,10 @@ impl<F: Field> Config<F> {
         U64: Codec<[H::U]>,
     {
         assert!(
-            self.num_rounds == 0 || self.initial_size.next_power_of_two() >= 1 << self.num_rounds
+            self.num_rounds == 0 || self.final_size() >= 1,
+            "too many rounds ({}) for initial_size {}",
+            self.num_rounds,
+            self.initial_size,
         );
         assert!(self.mask_length == 0 || self.mask_length >= 3);
 
@@ -242,7 +258,7 @@ mod tests {
     use crate::{
         algebra::{
             fields::{self, Field64},
-            multilinear_extend, random_vector,
+            random_vector,
         },
         transcript::DomainSeparator,
         utils::zip_strict,
@@ -254,10 +270,15 @@ mod tests {
                 3 => Just(0_usize),
                 7 => 3_usize..100,
             ];
-            (0_usize..(1 << 12), 0_usize..12, mask_length).prop_map(
+            (0_usize..(1 << 12), 0_usize..16, mask_length).prop_map(
                 |(initial_size, num_rounds, mask_length)| {
-                    let num_rounds =
-                        num_rounds.min(initial_size.next_power_of_two().trailing_zeros() as usize);
+                    // Max rounds = ceil(log2(initial_size)) for len/2 halving.
+                    let max_rounds = if initial_size <= 1 {
+                        0
+                    } else {
+                        (usize::BITS - (initial_size - 1).leading_zeros()) as usize
+                    };
+                    let num_rounds = num_rounds.min(max_rounds);
                     Self {
                         field: Type::new(),
                         initial_size,
@@ -305,13 +326,33 @@ mod tests {
         )
         .map(|(m, x)| univariate_evaluate(m, *x))
         .sum::<F>();
-        assert_eq!(vector.len(), config.final_size());
+        assert_eq!(
+            vector.len(),
+            config.final_size(),
+            "vector.len()={} != final_size()={} for initial_size={} num_rounds={}",
+            vector.len(),
+            config.final_size(),
+            config.initial_size,
+            config.num_rounds
+        );
         assert_eq!(covector.len(), config.final_size());
         assert_eq!(mask_sum, expected_mask_sum);
         assert_eq!(mask_sum + mask_rlc * dot(&vector, &covector), sum);
         if config.final_size() == 1 {
-            assert_eq!(multilinear_extend(&initial_vector, &point), vector[0]);
-            assert_eq!(multilinear_extend(&initial_covector, &point), covector[0]);
+            // Verify by replaying the fold on the initial vector.
+            use crate::algebra::sumcheck::fold;
+            let mut v_check = initial_vector.clone();
+            for &r in &point {
+                fold(&mut v_check, r);
+            }
+            assert_eq!(v_check.len(), 1);
+            assert_eq!(v_check[0], vector[0]);
+
+            let mut c_check = initial_covector.clone();
+            for &r in &point {
+                fold(&mut c_check, r);
+            }
+            assert_eq!(c_check[0], covector[0]);
         } else {
             // TODO: Check correct folding.
         }

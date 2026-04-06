@@ -8,6 +8,7 @@ use crate::{
     bits::Bits,
     parameters::ProtocolParameters,
     protocols::{irs_commit, proof_of_work, sumcheck},
+    smooth_domain::is_smooth,
     type_info::Type,
 };
 
@@ -18,8 +19,8 @@ impl<M: Embedding> Config<M> {
         M: Default,
     {
         assert!(
-            size.is_power_of_two(),
-            "Only powers of two size are supported at the moment."
+            is_smooth(size),
+            "Size must be a smooth-{{2,3}} number (2^a * 3^b), got {size}."
         );
 
         // Proof of work constructor with the requested hash function.
@@ -34,7 +35,11 @@ impl<M: Embedding> Config<M> {
             .saturating_sub(whir_parameters.pow_bits) as f64;
         let field_size_bits = M::Target::field_size_bits();
         let mut log_inv_rate = whir_parameters.starting_log_inv_rate;
-        let mut num_variables = size.trailing_zeros() as usize;
+        // num_variables tracks only the binary part (powers of 2 in size).
+        // For smooth sizes 2^a * 3^b, num_variables = a. The 3^b residual
+        // is handled by the final sumcheck.
+        let mut num_binary_variables = size.trailing_zeros() as usize;
+        let mut current_size = size;
 
         #[allow(clippy::cast_possible_wrap)]
         let initial_committer = irs_commit::Config::new(
@@ -66,8 +71,9 @@ impl<M: Embedding> Config<M> {
         let mut round = 0;
         let mut in_domain_samples = initial_committer.in_domain_samples;
         let mut query_error = initial_committer.rbr_queries();
-        num_variables -= whir_parameters.initial_folding_factor;
-        while num_variables >= whir_parameters.folding_factor {
+        num_binary_variables -= whir_parameters.initial_folding_factor;
+        current_size >>= whir_parameters.initial_folding_factor;
+        while num_binary_variables >= whir_parameters.folding_factor {
             // Queries are set w.r.t. to old rate, while the rest to the new rate
             let round_folding_factor = if round == 0 {
                 whir_parameters.initial_folding_factor
@@ -82,7 +88,7 @@ impl<M: Embedding> Config<M> {
                 whir_parameters.unique_decoding,
                 whir_parameters.hash_id,
                 1,
-                1 << num_variables,
+                current_size,
                 1 << whir_parameters.folding_factor,
                 0.5_f64.powi(next_rate as i32),
             );
@@ -105,7 +111,7 @@ impl<M: Embedding> Config<M> {
                 irs_committer,
                 sumcheck: sumcheck::Config {
                     field: Type::new(),
-                    initial_size: 1 << num_variables,
+                    initial_size: current_size,
                     round_pow: pow(folding_pow_bits),
                     num_rounds: whir_parameters.folding_factor,
                     mask_length: 0,
@@ -114,7 +120,8 @@ impl<M: Embedding> Config<M> {
             };
 
             round += 1;
-            num_variables -= whir_parameters.folding_factor;
+            num_binary_variables -= whir_parameters.folding_factor;
+            current_size >>= whir_parameters.folding_factor;
             log_inv_rate = next_rate;
             in_domain_samples = config.irs_committer.in_domain_samples;
             query_error = config.irs_committer.rbr_queries();
@@ -142,9 +149,13 @@ impl<M: Embedding> Config<M> {
             round_configs,
             final_sumcheck: sumcheck::Config {
                 field: Type::new(),
-                initial_size: 1 << num_variables,
+                initial_size: current_size,
                 round_pow: pow(final_folding_pow_bits),
-                num_rounds: num_variables,
+                num_rounds: if current_size <= 1 {
+                    0
+                } else {
+                    (usize::BITS - (current_size - 1).leading_zeros()) as usize
+                },
                 mask_length: 0,
             },
             final_pow: pow(final_pow_bits),
@@ -270,8 +281,11 @@ impl<M: Embedding> Config<M> {
     }
 
     pub fn initial_num_variables(&self) -> usize {
-        assert!(self.initial_size().is_power_of_two());
-        self.initial_size().trailing_zeros() as usize
+        let s = self.initial_size();
+        if s <= 1 {
+            return 0;
+        }
+        (usize::BITS - (s - 1).leading_zeros()) as usize
     }
 
     pub fn final_size(&self) -> usize {
@@ -443,8 +457,11 @@ impl<F: Field> RoundConfig<F> {
     }
 
     pub fn initial_num_variables(&self) -> usize {
-        assert!(self.irs_committer.vector_size.is_power_of_two());
-        self.irs_committer.vector_size.ilog2() as usize
+        let s = self.irs_committer.vector_size;
+        if s <= 1 {
+            return 0;
+        }
+        (usize::BITS - (s - 1).leading_zeros()) as usize
     }
 
     pub fn final_num_variables(&self) -> usize {

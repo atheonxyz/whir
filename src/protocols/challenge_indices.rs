@@ -16,19 +16,21 @@ where
     if count == 0 {
         return Vec::new();
     }
-    // TODO: This is blocking non-power-of-two support.
-    assert!(
-        num_leaves.is_power_of_two(),
-        "Number of leaves must be a power of two for unbiased results."
-    );
+    assert!(num_leaves > 0, "Number of leaves must be positive.");
     if num_leaves == 1 {
         // `size_bytes` would be zero, making `chunks_exact` panic.
         return if deduplicate { vec![0] } else { vec![0; count] };
     }
 
-    // Calculate the required bytes of entropy
-    // TODO: Round total to bytes, instead of per index.
-    let size_bytes = (num_leaves.ilog2() as usize).div_ceil(8);
+    // Calculate the required bytes of entropy per index.
+    // For power-of-2, use exactly ceil(log2(N)) bits (no bias).
+    // For non-power-of-2, add 8 extra bytes to make modular bias < 2^{-64}.
+    let size_bytes = if num_leaves.is_power_of_two() {
+        (num_leaves.ilog2() as usize).div_ceil(8)
+    } else {
+        let bits_needed = usize::BITS - (num_leaves - 1).leading_zeros();
+        (bits_needed as usize).div_ceil(8) + 8
+    };
 
     // Get required entropy bits.
     let entropy: Vec<u8> = (0..count * size_bytes)

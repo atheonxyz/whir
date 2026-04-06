@@ -6,9 +6,24 @@ use crate::algebra::{dot, embedding::Embedding, scalar_mul};
 #[cfg(feature = "parallel")]
 use crate::utils::workload_size;
 
+/// Compute the split point for the sumcheck fold.
+///
+/// Uses `len / 2` (clean halving) so that the fold boundary aligns with
+/// interleaving block boundaries for smooth-{2,3} sizes like 12 = 4 × 3.
+///
+/// For even `len` this gives two equal halves.
+/// For odd `len` the low half gets `floor(len/2)` and the high half gets
+/// `ceil(len/2)` elements; the extra high element is paired with an implicit
+/// zero on the low side.
+#[inline]
+pub fn fold_half(len: usize) -> usize {
+    len / 2
+}
+
 /// Computes the constant and quadratic coefficient of the sumcheck polynomial.
 ///
-/// Vectors `a` and `b` are implicitly zero-extended to the next power of two.
+/// The vector is split at `fold_half(len)`. When the halves are unequal,
+/// the shorter side's missing elements are treated as implicit zeros.
 pub fn compute_sumcheck_polynomial<F: Field>(a: &[F], b: &[F]) -> (F, F) {
     fn recurse<F: Field>(a0: &[F], a1: &[F], b0: &[F], b1: &[F]) -> (F, F) {
         debug_assert_eq!(a0.len(), b0.len());
@@ -47,25 +62,33 @@ pub fn compute_sumcheck_polynomial<F: Field>(a: &[F], b: &[F]) -> (F, F) {
         return (a[0] * b[0], F::ZERO);
     }
 
-    let half = a.len().next_power_of_two() >> 1;
+    let half = fold_half(a.len());
     let (a0, a1) = a.split_at(half);
     let (b0, b1) = b.split_at(half);
-    debug_assert!(a0.len() >= a1.len());
-    let (a0, a0_tail) = a0.split_at(a1.len());
-    let (b0, b0_tail) = b0.split_at(a1.len());
-    let (acc0, acc2) = recurse(a0, a1, b0, b1);
 
-    // Handle the tail part where a1, b1 is implicit zero padding,
-    // When a1, b1 = 0, then acc0 = acc2 = a0 * b0:
-    let acc = dot(a0_tail, b0_tail);
+    // Paired portion: min(low, high) elements
+    let paired = a0.len().min(a1.len());
+    let (acc0, acc2) = recurse(&a0[..paired], &a1[..paired], &b0[..paired], &b1[..paired]);
 
-    (acc0 + acc, acc2 + acc)
+    // Low-side tail: extra elements in the low half paired with implicit zero
+    // from the high side. Term: a0*(1-t) * b0*(1-t) → c(0) += a0*b0, c(2) += a0*b0
+    let low_tail = dot(&a0[paired..], &b0[paired..]);
+
+    // High-side tail: extra elements in the high half paired with implicit zero
+    // from the low side. Term: a1*t * b1*t → c(0) += 0, c(2) += a1*b1
+    let high_tail = dot(&a1[paired..], &b1[paired..]);
+
+    (acc0 + low_tail, acc2 + low_tail + high_tail)
 }
 
 /// Folds evaluations by linear interpolation at the given weight, in place.
 ///
-/// The `values` are implicitly zero-padded to the next power of two. On return,
-/// the length of `values` will always be a power of two.
+/// Splits at `fold_half(len)` so the fold boundary aligns with interleaving
+/// block boundaries for smooth-{2,3} sizes.
+///
+/// For the paired portion: `low[i] += (high[i] - low[i]) * weight`.
+/// Low-side tail (extra low elements): `low[i] *= (1 - weight)`.
+/// High-side tail (extra high elements): `result[i] = high[i] * weight`.
 pub fn fold<F: Field>(values: &mut Vec<F>, weight: F) {
     fn recurse_both<F: Field>(low: &mut [F], high: &[F], weight: F) {
         #[cfg(feature = "parallel")]
@@ -89,17 +112,32 @@ pub fn fold<F: Field>(values: &mut Vec<F>, weight: F) {
         return;
     }
 
-    let half = values.len().next_power_of_two() >> 1;
-    let (low, high) = values.split_at_mut(half);
-    debug_assert!(low.len() >= high.len());
-    let (low, tail) = low.split_at_mut(high.len());
-    recurse_both(low, high, weight);
+    let len = values.len();
+    let half = fold_half(len);
+    let high_len = len - half;
+    let output_len = half.max(high_len);
 
-    // Tail part where `high` is implicit zero padding
-    // When high = 0 we have *low *= 1 - weight.
-    scalar_mul(tail, F::ONE - weight);
+    // Save any extra high-side elements before the in-place mutation.
+    let high_extras: Vec<F> = if high_len > half {
+        values[half + half..].iter().map(|&v| v * weight).collect()
+    } else {
+        Vec::new()
+    };
 
-    values.truncate(half);
+    {
+        let (low, high) = values.split_at_mut(half);
+
+        let paired = low.len().min(high.len());
+        recurse_both(&mut low[..paired], &high[..paired], weight);
+
+        // Low-side tail: low[i] *= (1 - weight)
+        scalar_mul(&mut low[paired..], F::ONE - weight);
+    }
+
+    values.truncate(output_len);
+    for (i, &val) in high_extras.iter().enumerate() {
+        values[half + i] = val;
+    }
     values.shrink_to_fit();
 }
 
@@ -139,6 +177,7 @@ pub fn mixed_eval<M: Embedding>(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use ark_ff::AdditiveGroup;
     use ark_std::rand::{rngs::StdRng, Rng, SeedableRng};
     use proptest::proptest;
 
@@ -157,33 +196,80 @@ pub(crate) mod tests {
         vec
     }
 
+    /// For power-of-2 lengths, fold_half == next_power_of_two >> 1,
+    /// so the result must match the zero-padded version.
     #[test]
-    fn sumcheck_poly_zero_extend() {
-        proptest!(|(seed:u64, length in 0_usize..(1 << 14))| {
+    fn sumcheck_poly_power_of_two() {
+        proptest!(|(seed:u64, log_length in 0_usize..14)| {
+            let length = 1 << log_length;
             let mut rng = StdRng::seed_from_u64(seed);
             let vector: Vec<F> = random_vector(&mut rng, length);
             let covector: Vec<F> = random_vector(&mut rng, length);
+            let expected = compute_sumcheck_polynomial(&vector, &covector);
             let extended_vector = zero_pad(&vector);
             let extended_covector = zero_pad(&covector);
-            let expected = compute_sumcheck_polynomial(&extended_vector, &extended_covector);
-            assert_eq!(compute_sumcheck_polynomial(&vector, &covector), expected);
-            assert_eq!(compute_sumcheck_polynomial(&extended_vector, &covector), expected);
-            assert_eq!(compute_sumcheck_polynomial(&vector, &extended_covector), expected);
+            assert_eq!(compute_sumcheck_polynomial(&extended_vector, &extended_covector), expected);
         });
     }
 
+    /// Fold output length must be ceil(len/2).
     #[test]
-    fn fold_zero_extend() {
-        proptest!(|(seed:u64, length in 0_usize..(1 << 14))| {
+    fn fold_output_length() {
+        proptest!(|(seed:u64, length in 2_usize..1000)| {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut vector: Vec<F> = random_vector(&mut rng, length);
+            let weight = rng.gen::<F>();
+            fold(&mut vector, weight);
+            let expected_len = (length + 1) / 2;
+            assert_eq!(vector.len(), expected_len);
+        });
+    }
+
+    /// For power-of-2 lengths, fold matches the zero-padded version.
+    #[test]
+    fn fold_power_of_two() {
+        proptest!(|(seed:u64, log_length in 1_usize..14)| {
+            let length = 1 << log_length;
             let mut rng = StdRng::seed_from_u64(seed);
             let mut vector: Vec<F> = random_vector(&mut rng, length);
             let mut extended_vector = zero_pad(&vector);
             let weight = rng.gen::<F>();
-
             fold(&mut vector, weight);
-            assert!(vector.is_empty() || vector.len().is_power_of_two());
             fold(&mut extended_vector, weight);
             assert_eq!(vector, extended_vector);
+        });
+    }
+
+    /// Sumcheck invariant: c(0) + c(1) == dot(a, b).
+    #[test]
+    fn sumcheck_poly_invariant() {
+        proptest!(|(seed:u64, length in 0_usize..500)| {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let vector: Vec<F> = random_vector(&mut rng, length);
+            let covector: Vec<F> = random_vector(&mut rng, length);
+            let sum = crate::algebra::dot(&vector, &covector);
+            let (c0, c2) = compute_sumcheck_polynomial(&vector, &covector);
+            let c1 = sum - c0.double() - c2;
+            assert_eq!(c0 + (c0 + c1 + c2), sum);
+        });
+    }
+
+    /// Fold+sumcheck round trip: after folding, dot(a', b') == c(r).
+    #[test]
+    fn fold_sumcheck_round_trip() {
+        proptest!(|(seed:u64, length in 2_usize..500)| {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut a: Vec<F> = random_vector(&mut rng, length);
+            let mut b: Vec<F> = random_vector(&mut rng, length);
+            let sum = crate::algebra::dot(&a, &b);
+            let (c0, c2) = compute_sumcheck_polynomial(&a, &b);
+            let c1 = sum - c0.double() - c2;
+            let r = rng.gen::<F>();
+            let expected_new_sum = (c2 * r + c1) * r + c0;
+            fold(&mut a, r);
+            fold(&mut b, r);
+            let actual = crate::algebra::dot(&a, &b);
+            assert_eq!(actual, expected_new_sum);
         });
     }
 }

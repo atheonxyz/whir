@@ -2,13 +2,13 @@ use ark_ff::{AdditiveGroup, Field};
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
-use super::{fold_based_mle_evaluate, Commitment, Config};
+use super::{fold_based_mle_evaluate, sum_x_fold_eq, Commitment, Config};
 use crate::{
     algebra::{
         dot,
         embedding::{Embedding, Identity},
         eq_weights,
-        linear_form::{Evaluate, MultilinearExtension},
+        linear_form::{Evaluate, LinearForm, MultilinearExtension},
         tensor_product,
     },
     hash::Hash,
@@ -261,9 +261,19 @@ impl<M: Embedding> Config<M> {
                 |p| self.round_configs[p].initial_size(),
             );
             let start = evaluation_point.len().saturating_sub(num_variables);
-            for (rlc_coeff, weights) in zip_strict(weights_rlc_coeffs, weights) {
-                let val = fold_based_mle_evaluate(&weights, &evaluation_point[start..], round_size);
-                linear_form_rlc -= rlc_coeff * val;
+
+            if round_size.is_power_of_two() {
+                // Power-of-2: use the fast O(log n) tensor identity.
+                for (rlc_coeff, weights) in zip_strict(weights_rlc_coeffs, weights) {
+                    linear_form_rlc -= rlc_coeff * weights.mle_evaluate(&evaluation_point[start..]);
+                }
+            } else {
+                // Smooth: O(log^2 n) per constraint via the smooth tensor identity.
+                let point = &evaluation_point[start..];
+                for (rlc_coeff, weights) in zip_strict(weights_rlc_coeffs, weights) {
+                    let val = sum_x_fold_eq(weights.point, point, round_size);
+                    linear_form_rlc -= rlc_coeff * val;
+                }
             }
         }
 

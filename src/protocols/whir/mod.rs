@@ -60,11 +60,154 @@ pub struct FinalClaim<F: Field> {
     pub linear_form_rlc: F,
 }
 
+/// Compute the fold-eq-weights: for each position i in a vector of `size`
+/// elements, compute the coefficient that position i receives after folding
+/// with all challenges. This is the smooth-domain analogue of the eq polynomial.
+///
+/// The fold at `len/2` produces:
+///   result[i] = (1-r)*low[i] + r*high[i]     (paired)
+///   result[j] = r*high[j]                     (high tail)
+///
+/// Going in reverse (expanding), each output weight distributes to its
+/// low and high sources.
+fn fold_eq_weights<F: Field>(size: usize, challenges: &[F]) -> Vec<F> {
+    // Compute the fold size schedule: size → ceil(size/2) → ... → 1
+    let mut sizes = Vec::with_capacity(challenges.len() + 1);
+    sizes.push(size);
+    let mut s = size;
+    for _ in challenges {
+        if s <= 1 {
+            break;
+        }
+        s = (s + 1) / 2;
+        sizes.push(s);
+    }
+
+    // Start from the final size (1 element with weight 1)
+    let final_idx = sizes.len() - 1;
+    let mut weights = vec![F::ONE; sizes[final_idx]];
+
+    // Expand backwards through each fold round
+    for round in (0..final_idx).rev() {
+        let before_size = sizes[round];
+        let half = before_size / 2;
+        let after_size = sizes[round + 1]; // = max(half, before_size - half)
+        let r = challenges[round];
+        let one_minus_r = F::ONE - r;
+
+        let mut new_weights = vec![F::ZERO; before_size];
+
+        // Reverse the fold mapping:
+        // Forward: output[i] = (1-r)*input[i] + r*input[half+i]  for i < paired
+        //          output[i] = (1-r)*input[i]                     for i in paired..half (low tail)
+        //          output[j'] = r*input[half+j]                   for j in paired..high_len (high tail)
+        //
+        // Reverse: input[i] += output_w[i] * (1-r)               for i < half
+        //          input[half+i] += output_w[i] * r               for i < paired
+        //          input[half+j] += output_w[j'] * r              for high tail
+        let paired = half.min(before_size - half);
+
+        for i in 0..paired {
+            new_weights[i] += weights[i] * one_minus_r;
+            new_weights[half + i] += weights[i] * r;
+        }
+        // Low tail: output[i] = (1-r)*input[i], so input[i] gets weight * (1-r)
+        // But for len/2 split, low tail only exists when half > high_len,
+        // i.e., when high_len < half. For even sizes, paired == half == high_len, no tails.
+        // For odd sizes, high_len = half + 1 > half, so NO low tail, only high tail.
+        for i in paired..half {
+            new_weights[i] += weights[i] * one_minus_r;
+        }
+        // High tail: in the forward fold, output[half + (j - paired)] = r * input[half + j]
+        let high_len = before_size - half;
+        for j in paired..high_len {
+            let out_pos = half + (j - paired);
+            if out_pos < after_size {
+                new_weights[half + j] += weights[out_pos] * r;
+            }
+        }
+
+        weights = new_weights;
+    }
+
+    weights
+}
+
+/// Compute the fold coefficient for a single position traced through all rounds.
+///
+/// O(k) where k = challenges.len().
+fn fold_coeff<F: Field>(mut pos: usize, challenges: &[F], size: usize) -> F {
+    let mut coeff = F::ONE;
+    let mut s = size;
+    for &r in challenges {
+        if s <= 1 {
+            break;
+        }
+        let half = s / 2;
+        if pos < half {
+            coeff *= F::ONE - r;
+        } else {
+            coeff *= r;
+            pos -= half;
+        }
+        s = (s + 1) / 2;
+    }
+    coeff
+}
+
+/// O(log² n) smooth tensor identity for `UnivariateEvaluation`.
+///
+/// Computes `Σ_{i=0}^{size-1} x^i · fold_eq(i, challenges, size)` using
+/// the recursive decomposition:
+///
+///   Even size: S = ((1-r) + r·x^half) · S_next
+///   Odd size:  S = ((1-r) + r·x^half) · S_next - (1-r)·x^half·fold_coeff(half)
+///
+/// The correction term accounts for the low half having one fewer element
+/// than the high half when `size` is odd.
+pub fn sum_x_fold_eq<F: Field>(x: F, challenges: &[F], size: usize) -> F {
+    if size == 0 {
+        return F::ZERO;
+    }
+    if size == 1 || challenges.is_empty() {
+        return F::ONE;
+    }
+
+    let half = size / 2;
+    let r = challenges[0];
+    let rest = &challenges[1..];
+    let next_size = (size + 1) / 2;
+
+    // x^half via repeated squaring — O(log n)
+    let x_half = x.pow([half as u64]);
+    let factor = (F::ONE - r) + r * x_half;
+
+    // Recurse on the next (smaller) size
+    let s_next = sum_x_fold_eq(x, rest, next_size);
+    let mut result = factor * s_next;
+
+    // Correction for odd sizes: the low partial sum has `half` terms
+    // but S_next sums over `next_size = half + 1` terms. Subtract
+    // the extra term's contribution.
+    if size % 2 == 1 {
+        let correction = fold_coeff(half, rest, next_size);
+        result -= (F::ONE - r) * x_half * correction;
+    }
+
+    result
+}
+
+/// Evaluate `Σ lf.weight(i) * eq[i]` — accumulate into a buffer, then dot.
+fn fold_based_dot_evaluate<F: Field>(lf: &dyn LinearForm<F>, eq: &[F]) -> F {
+    let mut w = vec![F::ZERO; eq.len()];
+    lf.accumulate(&mut w, F::ONE);
+    crate::algebra::dot(&w, eq)
+}
+
 /// Evaluate a linear form's MLE at a point, handling smooth-domain sizes.
 ///
 /// For power-of-2 sizes, this is equivalent to `lf.mle_evaluate(point)`.
-/// For smooth sizes `2^a * 3^b`, materializes the weight vector and folds
-/// using `fold()` at `len/2` to match the prover's fold sequence exactly.
+/// For smooth sizes, computes fold-eq-weights and dots with the linear form.
 pub fn fold_based_mle_evaluate<F: Field>(
     lf: &dyn LinearForm<F>,
     point: &[F],
@@ -74,16 +217,8 @@ pub fn fold_based_mle_evaluate<F: Field>(
         return lf.mle_evaluate(point);
     }
 
-    let mut w = vec![F::ZERO; smooth_size];
-    lf.accumulate(&mut w, F::ONE);
-
-    use crate::algebra::sumcheck::fold;
-    for &r in point {
-        fold(&mut w, r);
-    }
-
-    debug_assert_eq!(w.len(), 1);
-    w[0]
+    let eq = fold_eq_weights(smooth_size, point);
+    fold_based_dot_evaluate(lf, &eq)
 }
 
 impl<F: Field> FinalClaim<F> {

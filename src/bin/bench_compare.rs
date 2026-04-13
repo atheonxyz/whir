@@ -1,3 +1,12 @@
+//! Benchmark comparing power-of-2 (pre-NTT3) vs smooth-{2,3} (NTT3) paths.
+//!
+//! For each real witness size N = 3 * 2^a:
+//!   - pow2 path:   pad N → next_power_of_two(N), commit+prove+verify
+//!   - smooth path: commit+prove+verify directly at N (uses ternary folding)
+//!
+//! Outputs CSV: n,path,prove_ms,prove_peak_mb,verify_ms,verify_peak_mb
+
+use ark_ff::AdditiveGroup;
 use ark_std::rand::thread_rng;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Cow;
@@ -15,6 +24,7 @@ use whir::{
     transcript::{codecs::Empty, DomainSeparator, ProverState, VerifierState},
 };
 
+// ─── Tracking allocator ──────────────────────────────────────────────
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 struct TA;
@@ -57,38 +67,42 @@ fn get_peak_mb() -> f64 {
 type BF = Field256;
 type Cfg = whir::protocols::whir::Config<Identity<BF>>;
 const FF: usize = 3;
+
 fn wp() -> ProtocolParameters {
     ProtocolParameters {
-        security_level: 128,
-        pow_bits: 10,
+        security_level: 32,
+        pow_bits: 0,
         initial_folding_factor: FF,
         folding_factor: FF,
         unique_decoding: false,
-        starting_log_inv_rate: 2,
+        starting_log_inv_rate: 1,
         batch_size: 1,
         hash_id: hash::SHA2,
     }
 }
 
-/// Returns (prove_ms, prove_peak_mb, verify_ms, verify_peak_mb)
-fn run(sz: usize) -> (f64, f64, f64, f64) {
-    let p = Cfg::new(sz, &wp());
-    let v: Vec<Vec<BF>> = vec![random_vector(thread_rng(), sz)];
-    let vr = v.iter().map(|x| x.as_slice()).collect::<Vec<_>>();
-    let s = format!("b-{sz}");
+/// Run a full prove+verify cycle at `commit_size`, with `real_data` actual witness elements.
+/// Returns (prove_ms, prove_peak_mb, verify_ms, verify_peak_mb).
+fn run(real_data: usize, commit_size: usize) -> (f64, f64, f64, f64) {
+    let p = Cfg::new(commit_size, &wp());
+    let mut witness: Vec<BF> = random_vector(thread_rng(), real_data);
+    witness.resize(commit_size, BF::ZERO);
+    let vectors = vec![witness];
+    let vr = vectors.iter().map(|x| x.as_slice()).collect::<Vec<_>>();
+    let s = format!("b-{commit_size}");
     let ds = DomainSeparator::protocol(&p).session(&s).instance(&Empty);
     let mut ps = ProverState::new_std(&ds);
     let w = p.commit(&mut ps, &vr);
     let mut lfs: Vec<Box<dyn Evaluate<Identity<BF>>>> = Vec::new();
     lfs.push(Box::new(Covector {
-        vector: (0..sz as u64).map(BF::from).collect(),
+        vector: (0..commit_size as u64).map(BF::from).collect(),
     }));
     let vals = lfs
         .iter()
         .flat_map(|l| vr.iter().map(|v| l.evaluate(p.embedding(), v)))
         .collect::<Vec<_>>();
     let pf: Vec<Box<dyn LinearForm<BF>>> = vec![Box::new(Covector {
-        vector: (0..sz as u64).map(BF::from).collect(),
+        vector: (0..commit_size as u64).map(BF::from).collect(),
     })];
 
     // ── Prove ──
@@ -96,7 +110,10 @@ fn run(sz: usize) -> (f64, f64, f64, f64) {
     let t0 = Instant::now();
     let _ = p.prove(
         &mut ps,
-        v.iter().map(|x| Cow::Borrowed(x.as_slice())).collect(),
+        vectors
+            .iter()
+            .map(|x| Cow::Borrowed(x.as_slice()))
+            .collect(),
         vec![Cow::Owned(w)],
         pf,
         Cow::Borrowed(vals.as_slice()),
@@ -121,16 +138,18 @@ fn run(sz: usize) -> (f64, f64, f64, f64) {
     (prove_ms, prove_peak, verify_ms, verify_peak)
 }
 
-fn bench(sz: usize) -> (f64, f64, f64, f64) {
-    let _ = run(sz);
-    let mut b = run(sz);
+fn bench(real_data: usize, commit_size: usize) -> (f64, f64, f64, f64) {
+    // Warmup
+    let _ = run(real_data, commit_size);
+    // Best of 3
+    let mut best = run(real_data, commit_size);
     for _ in 0..2 {
-        let r = run(sz);
-        if r.0 < b.0 {
-            b = r;
+        let r = run(real_data, commit_size);
+        if r.0 < best.0 {
+            best = r;
         }
     }
-    b
+    best
 }
 
 fn next_smooth(mut n: usize) -> usize {
@@ -150,44 +169,39 @@ fn next_smooth(mut n: usize) -> usize {
 }
 
 fn main() {
-    let d = 1usize << FF;
-    let lo = 1usize << 12;
-    let hi = 1usize << 24;
-
-    // Generate ALL target sizes: pow2, 3*2^a, 9*2^a
+    let d = 1usize << FF; // interleaving depth must divide size
+                          // Target real-data sizes: 3 * 2^a for various a
     let mut targets: Vec<usize> = Vec::new();
-    let mut p = lo;
-    while p <= hi {
-        targets.push(p);
-        p *= 2;
-    }
     for a in 0..30 {
         let s = 3 * (1 << a);
-        if s >= lo && s <= hi && s % d == 0 {
-            targets.push(s);
-        }
-    }
-    for a in 0..30 {
-        let s = 9 * (1 << a);
-        if s >= lo && s <= hi && s % d == 0 {
+        if s >= (1 << 12) && s <= (1 << 18) && s % d == 0 {
             targets.push(s);
         }
     }
     targets.sort();
     targets.dedup();
 
-    // For each target: compute smooth commit size
-    println!("n,commit_size,prove_ms,prove_peak_mb,verify_ms,verify_peak_mb");
+    println!("n,path,prove_ms,prove_peak_mb,verify_ms,verify_peak_mb");
     for &n in &targets {
+        // ── Smooth path (NTT3 enabled) ──
         let mut cs = next_smooth(n);
         while cs % d != 0 {
             cs = next_smooth(cs + 1);
         }
-        let r = bench(cs);
-        println!("{n},{cs},{:.3},{:.1},{:.3},{:.1}", r.0, r.1, r.2, r.3);
+        let r = bench(n, cs);
+        println!("{n},smooth,{:.3},{:.1},{:.3},{:.1}", r.0, r.1, r.2, r.3);
         eprintln!(
-            "  n={n:>7} -> {cs:>7}  prove={:.1}ms  pmem={:.0}MB  verify={:.2}ms  vmem={:.0}MB",
+            "  n={n:>7} smooth={cs:>7}  prove={:.1}ms mem={:.0}MB verify={:.2}ms vmem={:.0}MB",
             r.0, r.1, r.2, r.3
+        );
+
+        // ── Pow2 path (pre-NTT3 baseline) ──
+        let pow2 = n.next_power_of_two();
+        let r2 = bench(n, pow2);
+        println!("{n},pow2,{:.3},{:.1},{:.3},{:.1}", r2.0, r2.1, r2.2, r2.3);
+        eprintln!(
+            "  n={n:>7} pow2={pow2:>7}    prove={:.1}ms mem={:.0}MB verify={:.2}ms vmem={:.0}MB",
+            r2.0, r2.1, r2.2, r2.3
         );
     }
 }

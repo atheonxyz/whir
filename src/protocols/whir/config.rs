@@ -35,9 +35,6 @@ impl<M: Embedding> Config<M> {
             .saturating_sub(whir_parameters.pow_bits) as f64;
         let field_size_bits = M::Target::field_size_bits();
         let mut log_inv_rate = whir_parameters.starting_log_inv_rate;
-        // num_variables tracks only the binary part (powers of 2 in size).
-        // For smooth sizes 2^a * 3^b, num_variables = a. The 3^b residual
-        // is handled by the final sumcheck.
         let mut num_binary_variables = size.trailing_zeros() as usize;
         let mut current_size = size;
 
@@ -71,6 +68,8 @@ impl<M: Embedding> Config<M> {
         let mut round = 0;
         let mut in_domain_samples = initial_committer.in_domain_samples;
         let mut query_error = initial_committer.rbr_queries();
+        // Initial and mid-round sumchecks use binary-only folding.
+        // Only the final sumcheck uses mixed ternary/binary.
         num_binary_variables -= whir_parameters.initial_folding_factor;
         current_size >>= whir_parameters.initial_folding_factor;
         while num_binary_variables >= whir_parameters.folding_factor {
@@ -115,6 +114,7 @@ impl<M: Embedding> Config<M> {
                     round_pow: pow(folding_pow_bits),
                     num_rounds: whir_parameters.folding_factor,
                     mask_length: 0,
+                    ternary: false,
                 },
                 pow: pow(pow_bits),
             };
@@ -144,6 +144,7 @@ impl<M: Embedding> Config<M> {
                 round_pow: pow(starting_folding_pow_bits),
                 num_rounds: whir_parameters.initial_folding_factor,
                 mask_length: 0,
+                ternary: false,
             },
             initial_skip_pow: pow(initial_skip_pow_bits),
             round_configs,
@@ -151,12 +152,9 @@ impl<M: Embedding> Config<M> {
                 field: Type::new(),
                 initial_size: current_size,
                 round_pow: pow(final_folding_pow_bits),
-                num_rounds: if current_size <= 1 {
-                    0
-                } else {
-                    (usize::BITS - (current_size - 1).leading_zeros()) as usize
-                },
+                num_rounds: sumcheck::rounds_to_one(current_size),
                 mask_length: 0,
+                ternary: true, // Use mixed ternary/binary for final fold-down
             },
             final_pow: pow(final_pow_bits),
         }
@@ -285,7 +283,15 @@ impl<M: Embedding> Config<M> {
         if s <= 1 {
             return 0;
         }
-        (usize::BITS - (s - 1).leading_zeros()) as usize
+        // Binary rounds for initial + mid-round sumchecks
+        let binary_rounds = self.initial_sumcheck.num_rounds
+            + self
+                .round_configs
+                .iter()
+                .map(|r| r.sumcheck.num_rounds)
+                .sum::<usize>();
+        // Final sumcheck uses mixed ternary/binary
+        binary_rounds + self.final_sumcheck.num_rounds
     }
 
     pub fn final_size(&self) -> usize {
@@ -562,6 +568,7 @@ mod tests {
                     round_pow: proof_of_work::Config::from_difficulty(Bits::new(19.0)),
                     num_rounds: 2,
                     mask_length: 0,
+                    ternary: false,
                 },
                 pow: proof_of_work::Config::from_difficulty(Bits::new(17.0)),
             },
@@ -585,6 +592,7 @@ mod tests {
                     round_pow: proof_of_work::Config::from_difficulty(Bits::new(19.5)),
                     num_rounds: 2,
                     mask_length: 0,
+                    ternary: false,
                 },
                 pow: proof_of_work::Config::from_difficulty(Bits::new(18.0)),
             },

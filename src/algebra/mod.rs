@@ -7,7 +7,9 @@ pub mod sumcheck;
 
 use ark_ff::{AdditiveGroup, Field};
 use ark_std::rand::{distributions::Standard, prelude::Distribution, Rng};
-pub use multilinear::{eq_weights, eval_eq, mixed_multilinear_extend, multilinear_extend};
+pub use multilinear::{
+    eq_weights, eval_eq, mixed_multilinear_extend, multilinear_extend, smooth_multilinear_extend,
+};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 

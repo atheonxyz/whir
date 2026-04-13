@@ -2,7 +2,7 @@ use ark_ff::{AdditiveGroup, Field};
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
-use super::{fold_based_mle_evaluate, sum_x_fold_eq, Commitment, Config};
+use super::{sum_x_fold_eq, Commitment, Config};
 use crate::{
     algebra::{
         dot,
@@ -225,11 +225,16 @@ impl<M: Embedding> Config<M> {
             verify!(weights.evaluate(&Identity::<M::Target>::new(), &final_vector) == evals);
         }
 
-        // Final sumcheck
+        // Final sumcheck (uses mixed ternary/binary folding)
         let final_sumcheck_randomness = self.final_sumcheck.verify(verifier_state, &mut the_sum)?.0;
         round_folding_randomness.push(final_sumcheck_randomness.clone());
 
         // Compute folding randomness across all rounds
+        let ternary_start = round_folding_randomness
+            .iter()
+            .take(round_folding_randomness.len().saturating_sub(1))
+            .map(|v| v.len())
+            .sum::<usize>();
         let evaluation_point = round_folding_randomness
             .into_iter()
             .flat_map(|poly| poly.into_iter())
@@ -240,22 +245,31 @@ impl<M: Embedding> Config<M> {
             MultilinearExtension::new(final_sumcheck_randomness)
                 .evaluate(&Identity::new(), &final_vector)
         } else {
-            use crate::algebra::sumcheck::fold;
-            let mut v = final_vector.clone();
-            for &r in &final_sumcheck_randomness {
-                fold(&mut v, r);
-            }
-            debug_assert_eq!(v.len(), 1);
-            v[0]
+            use crate::algebra::smooth_multilinear_extend;
+            smooth_multilinear_extend(&final_vector, &final_sumcheck_randomness, 0)
         };
         let mut linear_form_rlc = the_sum / poly_eval;
 
         // Subtract all internal linear forms.
         for (round, (weights_rlc_coeffs, weights)) in round_constraints.into_iter().enumerate() {
-            let num_variables = round.checked_sub(1).map_or_else(
-                || self.initial_num_variables(),
-                |p| self.round_configs[p].initial_num_variables(),
-            );
+            // Compute the total number of sumcheck challenges from this round's
+            // constraint domain down to the final fold. This includes:
+            //   - This round's sumcheck num_rounds
+            //   - All subsequent round sumcheck num_rounds
+            //   - The final sumcheck num_rounds
+            let num_variables = {
+                let from_round = if round == 0 { 0 } else { round - 1 };
+                let mut nv = if round == 0 {
+                    self.initial_sumcheck.num_rounds
+                } else {
+                    self.round_configs[from_round].sumcheck.num_rounds
+                };
+                for rc in &self.round_configs[round..] {
+                    nv += rc.sumcheck.num_rounds;
+                }
+                nv += self.final_sumcheck.num_rounds;
+                nv
+            };
             let round_size = round.checked_sub(1).map_or_else(
                 || self.initial_size(),
                 |p| self.round_configs[p].initial_size(),
@@ -268,10 +282,10 @@ impl<M: Embedding> Config<M> {
                     linear_form_rlc -= rlc_coeff * weights.mle_evaluate(&evaluation_point[start..]);
                 }
             } else {
-                // Smooth: O(log^2 n) per constraint via the smooth tensor identity.
+                // Smooth: tensor identity with mixed binary/ternary schedule.
                 let point = &evaluation_point[start..];
                 for (rlc_coeff, weights) in zip_strict(weights_rlc_coeffs, weights) {
-                    let val = sum_x_fold_eq(weights.point, point, round_size);
+                    let val = sum_x_fold_eq(weights.point, point, round_size, start, ternary_start);
                     linear_form_rlc -= rlc_coeff * val;
                 }
             }
@@ -282,6 +296,8 @@ impl<M: Embedding> Config<M> {
             evaluation_point,
             rlc_coefficients: initial_form_rlc_coeffs.to_vec(),
             linear_form_rlc,
+            ternary_start,
+            initial_size: self.initial_size(),
         })
     }
 }

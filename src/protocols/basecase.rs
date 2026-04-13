@@ -160,13 +160,8 @@ impl<F: Field> Config<F> {
                 verify!(value == expected);
             }
             let mle = {
-                use crate::algebra::sumcheck::fold;
-                let mut v = vector;
-                for &r in &point {
-                    fold(&mut v, r);
-                }
-                debug_assert_eq!(v.len(), 1);
-                v[0]
+                use crate::algebra::smooth_multilinear_extend;
+                smooth_multilinear_extend(&vector, &point, 0)
             };
             verify!(!mle.is_zero());
             let linear_mle = sum / mle;
@@ -201,13 +196,8 @@ impl<F: Field> Config<F> {
         // Compute implied MLE of the linear form
         // f*(r) · l(r) = sum  =>  l(r) = sum / f*(r)
         let masked_mle = {
-            use crate::algebra::sumcheck::fold;
-            let mut v = masked_vector;
-            for &r in &point {
-                fold(&mut v, r);
-            }
-            debug_assert_eq!(v.len(), 1);
-            v[0]
+            use crate::algebra::smooth_multilinear_extend;
+            smooth_multilinear_extend(&masked_vector, &point, 0)
         };
         verify!(!masked_mle.is_zero());
         let linear_mle = masked_sum / masked_mle;
@@ -241,8 +231,9 @@ mod tests {
                     field: Type::new(),
                     initial_size: size,
                     round_pow: proof_of_work::Config::none(),
-                    num_rounds: size.next_power_of_two().trailing_zeros() as usize,
+                    num_rounds: sumcheck::rounds_to_one(size),
                     mask_length: 0,
+                    ternary: true, // basecase processes full vector, use mixed folding
                 },
                 masked,
             })
@@ -276,10 +267,11 @@ mod tests {
             sum,
         );
         if config.size() > 0 {
-            use crate::algebra::sumcheck::fold;
+            use crate::protocols::sumcheck::fold_mixed;
             let mut cv = covector.clone();
+            let mut sz = cv.len();
             for &r in &point {
-                fold(&mut cv, r);
+                sz = fold_mixed(&mut cv, r, sz);
             }
             assert_eq!(cv.len(), 1);
             assert_eq!(cv[0], value);

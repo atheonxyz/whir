@@ -1,4 +1,8 @@
-//! Quadratic sumcheck protocol.
+//! Quadratic sumcheck protocol with mixed binary/ternary rounds.
+//!
+//! When the current size is divisible by 3, a ternary round is used
+//! (degree-4 polynomial, size → size/3). Otherwise a binary round is
+//! used (degree-2 polynomial, size → ceil(size/2)).
 
 use std::fmt;
 
@@ -11,7 +15,10 @@ use tracing::instrument;
 use crate::{
     algebra::{
         dot,
-        sumcheck::{compute_sumcheck_polynomial, fold, fold_and_compute_polynomial},
+        sumcheck::{
+            compute_sumcheck_polynomial, compute_sumcheck_polynomial3, fold, fold3,
+            fold_and_compute_polynomial,
+        },
         univariate_evaluate,
     },
     protocols::proof_of_work,
@@ -23,10 +30,28 @@ use crate::{
     utils::chunks_exact_or_empty,
 };
 
-/// Compute the size of a vector after `rounds` of folding at `len/2`.
+/// Returns true if this round should be a ternary fold (size divisible by 3).
+#[inline]
+pub fn is_ternary_round(size: usize) -> bool {
+    size >= 3 && size % 3 == 0
+}
+
+/// Compute the size after one fold step: ternary if divisible by 3, else binary.
+#[inline]
+pub fn fold_one_step(size: usize) -> usize {
+    if size <= 1 {
+        size
+    } else if is_ternary_round(size) {
+        size / 3
+    } else {
+        (size + 1) / 2
+    }
+}
+
+/// Compute the size after `rounds` of binary-only folding.
 ///
-/// Each fold: `size → ceil(size / 2)`. For even sizes, exact halving.
-pub fn fold_n_times(initial_size: usize, rounds: usize) -> usize {
+/// Each fold: `size → ceil(size / 2)`.
+pub fn fold_n_times_binary(initial_size: usize, rounds: usize) -> usize {
     let mut size = initial_size;
     for _ in 0..rounds {
         if size <= 1 {
@@ -35,6 +60,46 @@ pub fn fold_n_times(initial_size: usize, rounds: usize) -> usize {
         size = (size + 1) / 2;
     }
     size
+}
+
+/// Compute the size of a vector after `rounds` of mixed folding.
+///
+/// Each round: if size % 3 == 0, ternary fold (size → size/3);
+/// otherwise binary fold (size → ceil(size/2)).
+pub fn fold_n_times(initial_size: usize, rounds: usize) -> usize {
+    let mut size = initial_size;
+    for _ in 0..rounds {
+        if size <= 1 {
+            break;
+        }
+        size = fold_one_step(size);
+    }
+    size
+}
+
+/// Fold a vector one step using the mixed ternary/binary schedule.
+/// Returns the new size after folding.
+#[inline]
+pub fn fold_mixed<F: Field>(v: &mut Vec<F>, r: F, size: usize) -> usize {
+    use crate::algebra::sumcheck::{fold, fold3};
+    if is_ternary_round(size) {
+        fold3(v, r);
+        size / 3
+    } else {
+        fold(v, r);
+        (size + 1) / 2
+    }
+}
+
+/// Count the number of rounds needed to reduce `size` to 1 using mixed folding.
+pub fn rounds_to_one(size: usize) -> usize {
+    let mut s = size;
+    let mut rounds = 0;
+    while s > 1 {
+        s = fold_one_step(s);
+        rounds += 1;
+    }
+    rounds
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -48,21 +113,33 @@ where
     pub round_pow: proof_of_work::Config,
     pub num_rounds: usize,
     pub mask_length: usize,
+    /// When true, use mixed ternary/binary folding (ternary when size % 3 == 0).
+    /// When false, use binary-only folding (the default for non-final sumchecks).
+    #[serde(default)]
+    pub ternary: bool,
 }
 
 impl<F: Field> Config<F> {
-    /// Compute the vector size after `num_rounds` of folding at `len/2`.
+    /// Compute the vector size after `num_rounds` of folding.
     ///
-    /// Each fold: `size → ceil(size / 2)`. For even sizes, exact halving.
+    /// When `ternary` is true, uses mixed binary/ternary schedule.
+    /// Otherwise, each fold: `size → ceil(size / 2)`.
     pub fn final_size(&self) -> usize {
-        fold_n_times(self.initial_size, self.num_rounds)
+        if self.ternary {
+            fold_n_times(self.initial_size, self.num_rounds)
+        } else {
+            fold_n_times_binary(self.initial_size, self.num_rounds)
+        }
     }
 
-    /// Runs the quadratic sumcheck protocol as configured.
+    /// Runs the sumcheck protocol with mixed binary/ternary rounds.
     ///
     /// It reduces a claim of the form `dot(a, b) == sum` to an exponentially
     /// smaller claim `dot(a', b') == sum'` where `a'` is `a` folded in place
     /// and similarly for `b`.
+    ///
+    /// When the current vector size is divisible by 3, a ternary round is used
+    /// (degree-4 polynomial). Otherwise a binary round (degree-2 polynomial).
     ///
     /// This function:
     /// - Samples random values to progressively reduce the polynomial.
@@ -114,54 +191,114 @@ impl<F: Field> Config<F> {
         // We do a staggered Sumcheck loop so we can merge the inner fold+compute loops.
         let mut univariate = Vec::new();
         let mut res = Vec::with_capacity(self.num_rounds);
-        let mut folding_randomness = None;
+        let mut current_size = self.initial_size;
+        // Track: (is_ternary, folding_randomness) from previous round.
+        let mut prev_fold: Option<(bool, F)> = None;
+        let inv3 = F::from(3u64).inverse().expect("char != 3");
+        let three = F::from(3u64);
+        let five = F::from(5u64);
+        let nine = F::from(9u64);
+        let seventeen = F::from(17u64);
         for (round, mask) in
             chunks_exact_or_empty(masks, self.mask_length, self.num_rounds).enumerate()
         {
-            // Fold and compute sumcheck polynomial in one pass.
-            let (c0, c2) = if let Some(w) = folding_randomness {
-                fold_and_compute_polynomial(a, b, w)
+            let ternary = self.ternary && is_ternary_round(current_size);
+
+            if ternary {
+                // ─── Ternary round (degree-4 polynomial) ───
+                // Apply previous round's fold first, then compute current polynomial.
+                if let Some((prev_ternary, w)) = prev_fold {
+                    if prev_ternary {
+                        fold3(a, w);
+                        fold3(b, w);
+                    } else {
+                        fold(a, w);
+                        fold(b, w);
+                    }
+                }
+                let (p0, p2, p3, p4) = compute_sumcheck_polynomial3(a, b);
+                // c(0) + c(1) + c(2) = sum
+                // In coefficient form: 3p₀ + 3p₁ + 5p₂ + 9p₃ + 17p₄ = sum
+                let p1 = (*sum - three * p0 - five * p2 - nine * p3 - seventeen * p4) * inv3;
+
+                // TODO: ZK masking for ternary rounds (mask_length >= 5 needed)
+                assert!(
+                    mask.is_empty(),
+                    "ZK masking not yet supported for ternary sumcheck rounds"
+                );
+                prover_state.prover_messages(&[p0, p2, p3, p4]);
+
+                // Receive randomness and update sum
+                self.round_pow.prove(prover_state);
+                let r = prover_state.verifier_message::<F>();
+                res.push(r);
+                *sum = (((p4 * r + p3) * r + p2) * r + p1) * r + p0;
+
+                prev_fold = Some((true, r));
             } else {
-                compute_sumcheck_polynomial(a, b)
-            };
-            let c1 = *sum - c0.double() - c2;
+                // ─── Binary round (degree-2 polynomial) ───
+                let (c0, c2) = if let Some((prev_ternary, w)) = prev_fold {
+                    if prev_ternary {
+                        fold3(a, w);
+                        fold3(b, w);
+                        compute_sumcheck_polynomial(a, b)
+                    } else {
+                        fold_and_compute_polynomial(a, b, w)
+                    }
+                } else {
+                    compute_sumcheck_polynomial(a, b)
+                };
+                let c1 = *sum - c0.double() - c2;
 
-            // Optionally mask with univariate
-            if mask.is_empty() {
-                prover_state.prover_messages(&[c0, c2]);
-            } else {
-                // Initialize to round masking univariate polynomial.
-                univariate.clear();
-                let sum_multiple = F::from(1 << self.num_rounds.saturating_sub(round + 1));
-                univariate.extend(mask.iter().map(|m| sum_multiple * *m));
+                // Optionally mask with univariate
+                if mask.is_empty() {
+                    prover_state.prover_messages(&[c0, c2]);
+                } else {
+                    // Initialize to round masking univariate polynomial.
+                    univariate.clear();
+                    let sum_multiple = F::from(1 << self.num_rounds.saturating_sub(round + 1));
+                    univariate.extend(mask.iter().map(|m| sum_multiple * *m));
 
-                // Add constant term from previous and future masks.
-                univariate[0] += (mask_sum - sum_multiple * eval_01(mask)) * half;
+                    // Add constant term from previous and future masks.
+                    univariate[0] += (mask_sum - sum_multiple * eval_01(mask)) * half;
 
-                // Add plain sumcheck polynomial
-                univariate[0] += mask_rlc * c0;
-                univariate[1] += mask_rlc * c1;
-                univariate[2] += mask_rlc * c2;
+                    // Add plain sumcheck polynomial
+                    univariate[0] += mask_rlc * c0;
+                    univariate[1] += mask_rlc * c1;
+                    univariate[2] += mask_rlc * c2;
 
-                prover_state.prover_message(&univariate[0]);
-                prover_state.prover_messages(&univariate[2..]);
+                    prover_state.prover_message(&univariate[0]);
+                    prover_state.prover_messages(&univariate[2..]);
+                }
+
+                // Receive the random evaluation point and update the sum
+                self.round_pow.prove(prover_state);
+                let r = prover_state.verifier_message::<F>();
+                res.push(r);
+                *sum = (c2 * r + c1) * r + c0;
+                if !masks.is_empty() {
+                    let masked_sum = univariate_evaluate(&univariate, r);
+                    mask_sum = masked_sum - mask_rlc * *sum;
+                }
+
+                prev_fold = Some((false, r));
             }
 
-            // Receive the random evaluation point and update the sum
-            self.round_pow.prove(prover_state);
-            let r = prover_state.verifier_message::<F>();
-            res.push(r);
-            *sum = (c2 * r + c1) * r + c0;
-            if !masks.is_empty() {
-                let masked_sum = univariate_evaluate(&univariate, r);
-                mask_sum = masked_sum - mask_rlc * *sum;
+            if ternary {
+                current_size /= 3;
+            } else {
+                current_size = (current_size + 1) / 2;
             }
-            folding_randomness = Some(r);
         }
-        if let Some(w) = folding_randomness {
-            // Final fold of the inputs (no polynomial computation)
-            fold(a, w);
-            fold(b, w);
+        // Apply the final pending fold (no polynomial computation needed).
+        if let Some((prev_ternary, w)) = prev_fold {
+            if prev_ternary {
+                fold3(a, w);
+                fold3(b, w);
+            } else {
+                fold(a, w);
+                fold(b, w);
+            }
         }
 
         *sum = mask_sum + mask_rlc * *sum;
@@ -195,27 +332,66 @@ impl<F: Field> Config<F> {
             *sum = mask_sum + mask_rlc * *sum;
         }
 
-        let mut univariate = vec![F::ZERO; self.mask_length.max(3)];
+        let inv3 = F::from(3u64).inverse().expect("char != 3");
+        let three = F::from(3u64);
+        let five = F::from(5u64);
+        let nine = F::from(9u64);
+        let seventeen = F::from(17u64);
+        let mut current_size = self.initial_size;
+        // Binary rounds use degree-2 (3 coefficients), possibly extended by mask.
+        let binary_degree = self.mask_length.max(3);
+        let mut univariate = vec![F::ZERO; binary_degree];
         let mut res = Vec::with_capacity(self.num_rounds);
         for _ in 0..self.num_rounds {
-            // Receive all but linear coefficient.
-            univariate[0] = verifier_state.prover_message()?;
-            for c in &mut univariate[2..] {
-                *c = verifier_state.prover_message()?;
+            let ternary = self.ternary && is_ternary_round(current_size);
+
+            if ternary {
+                // ─── Ternary round: degree-4 polynomial ───
+                // Receive p₀, p₂, p₃, p₄ (4 prover messages)
+                let p0: F = verifier_state.prover_message()?;
+                let p2: F = verifier_state.prover_message()?;
+                let p3: F = verifier_state.prover_message()?;
+                let p4: F = verifier_state.prover_message()?;
+                // Derive p₁ from c(0)+c(1)+c(2) = sum:
+                //   3p₀ + 3p₁ + 5p₂ + 9p₃ + 17p₄ = sum
+                let p1 = (*sum - three * p0 - five * p2 - nine * p3 - seventeen * p4) * inv3;
+
+                // PoW
+                self.round_pow.verify(verifier_state)?;
+
+                // Random evaluation point
+                let r = verifier_state.verifier_message::<F>();
+                res.push(r);
+
+                // Update sum: c(r) = p₀ + p₁r + p₂r² + p₃r³ + p₄r⁴
+                *sum = (((p4 * r + p3) * r + p2) * r + p1) * r + p0;
+            } else {
+                // ─── Binary round: degree-2 polynomial ───
+                // Receive all but linear coefficient (c₀ and c₂..c_{d}).
+                univariate[0] = verifier_state.prover_message()?;
+                for c in &mut univariate[2..] {
+                    *c = verifier_state.prover_message()?;
+                }
+
+                // Derive linear coefficient from `univariate(0) + univariate(1) = sum`
+                univariate[1] = *sum - univariate[0].double() - univariate[2..].iter().sum::<F>();
+
+                // Check proof of work (if any)
+                self.round_pow.verify(verifier_state)?;
+
+                // Receive the random evaluation point
+                let folding_randomness = verifier_state.verifier_message::<F>();
+                res.push(folding_randomness);
+
+                // Update the sum
+                *sum = univariate_evaluate(&univariate, folding_randomness);
             }
 
-            // Derive linear coefficient from relation `univariate(0) + univariate(1) = sum`
-            univariate[1] = *sum - univariate[0].double() - univariate[2..].iter().sum::<F>();
-
-            // Check proof of work (if any)
-            self.round_pow.verify(verifier_state)?;
-
-            // Receive the random evaluation point
-            let folding_randomness = verifier_state.verifier_message::<F>();
-            res.push(folding_randomness);
-
-            // Update the sum
-            *sum = univariate_evaluate(&univariate, folding_randomness);
+            if ternary {
+                current_size /= 3;
+            } else {
+                current_size = (current_size + 1) / 2;
+            }
         }
         Ok((res, mask_rlc))
     }
@@ -272,19 +448,30 @@ mod tests {
             ];
             (0_usize..(1 << 12), 0_usize..16, mask_length).prop_map(
                 |(initial_size, num_rounds, mask_length)| {
-                    // Max rounds = ceil(log2(initial_size)) for len/2 halving.
-                    let max_rounds = if initial_size <= 1 {
-                        0
-                    } else {
-                        (usize::BITS - (initial_size - 1).leading_zeros()) as usize
-                    };
+                    let max_rounds = rounds_to_one(initial_size);
                     let num_rounds = num_rounds.min(max_rounds);
+                    // ZK masking is not yet supported for ternary sumcheck rounds.
+                    // Disable masks if any round in this config would be ternary.
+                    let has_ternary = {
+                        let mut s = initial_size;
+                        let mut found = false;
+                        for _ in 0..num_rounds {
+                            if is_ternary_round(s) {
+                                found = true;
+                                break;
+                            }
+                            s = fold_one_step(s);
+                        }
+                        found
+                    };
+                    let mask_length = if has_ternary { 0 } else { mask_length };
                     Self {
                         field: Type::new(),
                         initial_size,
                         num_rounds,
                         round_pow: proof_of_work::Config::none(),
                         mask_length,
+                        ternary: true,
                     }
                 },
             )
@@ -340,17 +527,18 @@ mod tests {
         assert_eq!(mask_sum + mask_rlc * dot(&vector, &covector), sum);
         if config.final_size() == 1 {
             // Verify by replaying the fold on the initial vector.
-            use crate::algebra::sumcheck::fold;
             let mut v_check = initial_vector.clone();
+            let mut sz = config.initial_size;
             for &r in &point {
-                fold(&mut v_check, r);
+                sz = fold_mixed(&mut v_check, r, sz);
             }
             assert_eq!(v_check.len(), 1);
             assert_eq!(v_check[0], vector[0]);
 
             let mut c_check = initial_covector.clone();
+            sz = config.initial_size;
             for &r in &point {
-                fold(&mut c_check, r);
+                sz = fold_mixed(&mut c_check, r, sz);
             }
             assert_eq!(c_check[0], covector[0]);
         } else {
@@ -391,34 +579,39 @@ mod tests {
                 round_pow: proof_of_work::Config::none(),
                 num_rounds: 1,
                 mask_length: 3,
+                ternary: true,
             },
         );
     }
 
     #[test]
     fn test_two_rounds() {
+        // initial_size=3 triggers a ternary round (3→1 in 1 round).
         test_config(
             0,
             &Config::<Field64> {
                 field: Type::new(),
                 initial_size: 3,
                 round_pow: proof_of_work::Config::none(),
-                num_rounds: 2,
-                mask_length: 3,
+                num_rounds: 1, // rounds_to_one(3) = 1 with ternary fold
+                mask_length: 0,
+                ternary: true,
             },
         );
     }
 
     #[test]
     fn test_three_rounds() {
+        // initial_size=5 → 3 → 1: round 1 binary (5→3), round 2 ternary (3→1).
         test_config(
             0,
             &Config::<Field64> {
                 field: Type::new(),
                 initial_size: 5,
                 round_pow: proof_of_work::Config::none(),
-                num_rounds: 3,
-                mask_length: 3,
+                num_rounds: 2, // rounds_to_one(5) = 2 with mixed folding
+                mask_length: 0,
+                ternary: true,
             },
         );
     }

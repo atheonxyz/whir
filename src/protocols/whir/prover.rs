@@ -205,7 +205,7 @@ impl<M: Embedding> Config<M> {
                 .map(|_| prover_state.verifier_message())
                 .collect();
             self.initial_skip_pow.prove(prover_state);
-            // Fold vector
+            // Fold vector (initial sumcheck is binary-only)
             for &f in &folding_randomness {
                 fold(&mut vector, f);
             }
@@ -300,7 +300,8 @@ impl<M: Embedding> Config<M> {
             }
         }
 
-        // Final sumcheck
+        // Final sumcheck (uses mixed ternary/binary folding)
+        let ternary_start = evaluation_point.len();
         let final_folding_randomness = self
             .final_sumcheck
             .prove(prover_state, &mut vector, &mut covector, &mut the_sum, &[])
@@ -311,6 +312,8 @@ impl<M: Embedding> Config<M> {
             evaluation_point,
             rlc_coefficients: initial_forms_rlc_coeffs.to_vec(),
             linear_form_rlc: M::Target::ZERO,
+            ternary_start,
+            initial_size: self.initial_size(),
         }
     }
 }

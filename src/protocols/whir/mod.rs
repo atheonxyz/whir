@@ -211,19 +211,18 @@ pub fn fold_based_mle_evaluate<F: Field>(
     }
 
     use crate::algebra::linear_form::Covector;
-    use crate::algebra::smooth_multilinear_extend;
+    use crate::algebra::{smooth_multilinear_extend, smooth_multilinear_extend_in_place};
     use std::any::Any;
 
-    // Fast path: if the linear form is a Covector, use smooth_multilinear_extend
-    // directly on its data — no allocation needed beyond the recursion stack.
+    // Fast path: if the linear form is a Covector, clone once then fold in-place.
     if let Some(cov) = (lf as &dyn Any).downcast_ref::<Covector<F>>() {
         return smooth_multilinear_extend(&cov.vector, point, ternary_start);
     }
 
-    // General path: materialize the weight vector, then evaluate.
+    // General path: materialize into fresh Vec, fold in-place (skip redundant clone).
     let mut w = vec![F::ZERO; smooth_size];
     lf.accumulate(&mut w, F::ONE);
-    smooth_multilinear_extend(&w, point, ternary_start)
+    smooth_multilinear_extend_in_place(&mut w, point, ternary_start)
 }
 
 impl<F: Field> FinalClaim<F> {

@@ -138,7 +138,6 @@ pub fn fold<F: Field>(values: &mut Vec<F>, weight: F) {
     for (i, &val) in high_extras.iter().enumerate() {
         values[half + i] = val;
     }
-    values.shrink_to_fit();
 }
 
 pub fn fold_and_compute_polynomial<F: Field>(a: &mut Vec<F>, b: &mut Vec<F>, weight: F) -> (F, F) {
@@ -188,7 +187,6 @@ pub fn fold3<F: Field>(values: &mut Vec<F>, weight: F) {
                 *v0 = *v0 * l0 + v1 * l1 + v2 * l2;
             });
         values.truncate(third);
-        values.shrink_to_fit();
         return;
     }
 
@@ -196,7 +194,6 @@ pub fn fold3<F: Field>(values: &mut Vec<F>, weight: F) {
         values[i] = values[i] * l0 + values[third + i] * l1 + values[2 * third + i] * l2;
     }
     values.truncate(third);
-    values.shrink_to_fit();
 }
 
 /// Compute the degree-4 sumcheck polynomial coefficients for a ternary round.

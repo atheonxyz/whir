@@ -39,3 +39,28 @@ pub const fn extra_rounds(n: usize) -> usize {
         (usize::BITS - (odd - 1).leading_zeros()) as usize
     }
 }
+
+/// 3-adicity of `n`: the exponent `b` such that `3^b | n` and `3^{b+1} ∤ n`.
+#[inline]
+pub const fn three_adicity(n: usize) -> usize {
+    assert!(n > 0);
+    let mut v = n;
+    let mut b = 0;
+    while v % 3 == 0 {
+        v /= 3;
+        b += 1;
+    }
+    b
+}
+
+/// Returns `3^b`.
+#[inline]
+pub const fn pow3(b: usize) -> usize {
+    let mut r = 1;
+    let mut i = 0;
+    while i < b {
+        r *= 3;
+        i += 1;
+    }
+    r
+}

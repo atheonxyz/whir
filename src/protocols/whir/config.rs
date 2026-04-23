@@ -8,7 +8,7 @@ use crate::{
     bits::Bits,
     parameters::ProtocolParameters,
     protocols::{irs_commit, proof_of_work, sumcheck},
-    smooth_domain::is_smooth,
+    smooth_domain::{is_smooth, pow3, three_adicity},
     type_info::Type,
 };
 
@@ -36,7 +36,23 @@ impl<M: Embedding> Config<M> {
         let field_size_bits = M::Target::field_size_bits();
         let mut log_inv_rate = whir_parameters.starting_log_inv_rate;
         let mut num_binary_variables = size.trailing_zeros() as usize;
-        let mut current_size = size;
+
+        // 3-adicity of the witness size. Ternary folds happen in the first
+        // WHIR round only; afterwards everything is pure pow2.
+        let b = three_adicity(size);
+        let three_pow_b = pow3(b);
+
+        // Initial round absorbs both the binary folding factor AND all `b`
+        // ternary rounds, so its interleaving depth is `2^ff · 3^b`.
+        assert!(
+            whir_parameters.initial_folding_factor <= num_binary_variables,
+            "initial_folding_factor ({}) exceeds 2-adicity of size ({}).",
+            whir_parameters.initial_folding_factor,
+            num_binary_variables,
+        );
+        let initial_interleaving_depth =
+            (1_usize << whir_parameters.initial_folding_factor) * three_pow_b;
+        let initial_num_rounds = whir_parameters.initial_folding_factor + b;
 
         #[allow(clippy::cast_possible_wrap)]
         let initial_committer = irs_commit::Config::new(
@@ -45,7 +61,7 @@ impl<M: Embedding> Config<M> {
             whir_parameters.hash_id,
             whir_parameters.batch_size,
             size,
-            1 << whir_parameters.initial_folding_factor,
+            initial_interleaving_depth,
             0.5_f64.powi(whir_parameters.starting_log_inv_rate as i32),
         );
 
@@ -60,7 +76,7 @@ impl<M: Embedding> Config<M> {
         // If we skip the initial sumcheck, we do this pow instead:
         let initial_skip_pow_bits = {
             let prox_gaps_error = initial_committer.rbr_soundness_fold_prox_gaps()
-                + (whir_parameters.initial_folding_factor as f64).log2();
+                + (initial_num_rounds as f64).log2();
             (security_level - prox_gaps_error).max(0.0)
         };
 
@@ -68,10 +84,10 @@ impl<M: Embedding> Config<M> {
         let mut round = 0;
         let mut in_domain_samples = initial_committer.in_domain_samples;
         let mut query_error = initial_committer.rbr_queries();
-        // Initial and mid-round sumchecks use binary-only folding.
-        // Only the final sumcheck uses mixed ternary/binary.
+        // After the initial round, the folded vector is pure pow2 (size 2^{a-ff}).
+        // All subsequent rounds use binary-only folding on pow2 sizes.
+        let mut current_size = size / initial_interleaving_depth;
         num_binary_variables -= whir_parameters.initial_folding_factor;
-        current_size >>= whir_parameters.initial_folding_factor;
         while num_binary_variables >= whir_parameters.folding_factor {
             // Queries are set w.r.t. to old rate, while the rest to the new rate
             let round_folding_factor = if round == 0 {
@@ -142,9 +158,12 @@ impl<M: Embedding> Config<M> {
                 field: Type::new(),
                 initial_size: size,
                 round_pow: pow(starting_folding_pow_bits),
-                num_rounds: whir_parameters.initial_folding_factor,
+                num_rounds: initial_num_rounds,
                 mask_length: 0,
-                ternary: false,
+                // Strategy A: ternary folds happen entirely within the initial
+                // sumcheck. After it, `current_size` is pure pow2 and all
+                // downstream rounds take the radix-2 / eq_weights fast paths.
+                ternary: b > 0,
             },
             initial_skip_pow: pow(initial_skip_pow_bits),
             round_configs,
@@ -154,7 +173,7 @@ impl<M: Embedding> Config<M> {
                 round_pow: pow(final_folding_pow_bits),
                 num_rounds: sumcheck::rounds_to_one(current_size),
                 mask_length: 0,
-                ternary: true, // Use mixed ternary/binary for final fold-down
+                ternary: false,
             },
             final_pow: pow(final_pow_bits),
         }

@@ -160,27 +160,42 @@ pub fn mixed_multilinear_extend<M: Embedding>(
 /// `ternary_start`: index in `point` at which ternary rounds begin.
 /// Challenges before this index always use binary folding.
 pub fn smooth_multilinear_extend<F: Field>(evals: &[F], point: &[F], ternary_start: usize) -> F {
-    use crate::algebra::sumcheck::{fold, fold3};
-    use crate::protocols::sumcheck::is_ternary_round;
-
     if evals.is_empty() {
         return F::ZERO;
     }
     if evals.len() == 1 || point.is_empty() {
         return evals[0];
     }
-
     let mut w = evals.to_vec();
+    smooth_multilinear_extend_in_place(&mut w, point, ternary_start)
+}
+
+/// In-place variant — consumes caller's buffer, no clone.
+pub fn smooth_multilinear_extend_in_place<F: Field>(
+    w: &mut Vec<F>,
+    point: &[F],
+    ternary_start: usize,
+) -> F {
+    use crate::algebra::sumcheck::{fold, fold3};
+    use crate::protocols::sumcheck::is_ternary_round;
+
+    if w.is_empty() {
+        return F::ZERO;
+    }
+    if w.len() == 1 || point.is_empty() {
+        return w[0];
+    }
+
     let mut size = w.len();
     for (i, &r) in point.iter().enumerate() {
         if size <= 1 {
             break;
         }
         if i >= ternary_start && is_ternary_round(size) {
-            fold3(&mut w, r);
+            fold3(w, r);
             size /= 3;
         } else {
-            fold(&mut w, r);
+            fold(w, r);
             size = (size + 1) / 2;
         }
     }
@@ -188,74 +203,76 @@ pub fn smooth_multilinear_extend<F: Field>(evals: &[F], point: &[F], ternary_sta
     w[0]
 }
 
-fn smooth_mle_inner<F: Field>(
-    evals: &[F],
-    point: &[F],
-    challenge_offset: usize,
-    ternary_start: usize,
-) -> F {
-    use crate::protocols::sumcheck::is_ternary_round;
-
-    if evals.is_empty() {
-        return F::ZERO;
-    }
-    if evals.len() == 1 || point.is_empty() {
-        return evals[0];
-    }
-
-    let size = evals.len();
-    let r = point[0];
-    let rest = &point[1..];
-    let is_tern = challenge_offset >= ternary_start && is_ternary_round(size);
-
-    if is_tern {
-        // Ternary: split into exact thirds — no allocation.
-        let third = size / 3;
-        let e0 = &evals[..third];
-        let e1 = &evals[third..2 * third];
-        let e2 = &evals[2 * third..];
-
-        let half_inv = F::from(2u64).inverse().expect("char != 2");
-        let two = F::from(2u64);
-        let l0 = (r - F::ONE) * (r - two) * half_inv;
-        let l1 = r * (two - r);
-        let l2 = r * (r - F::ONE) * half_inv;
-
-        let f0 = smooth_mle_inner(e0, rest, challenge_offset + 1, ternary_start);
-        let f1 = smooth_mle_inner(e1, rest, challenge_offset + 1, ternary_start);
-        let f2 = smooth_mle_inner(e2, rest, challenge_offset + 1, ternary_start);
-
-        f0 * l0 + f1 * l1 + f2 * l2
-    } else if size % 2 == 0 {
-        // Even binary: clean split — no allocation.
-        let half = size / 2;
-        let lo = &evals[..half];
-        let hi = &evals[half..];
-
-        let f0 = smooth_mle_inner(lo, rest, challenge_offset + 1, ternary_start);
-        let f1 = smooth_mle_inner(hi, rest, challenge_offset + 1, ternary_start);
-
-        f0 + (f1 - f0) * r
-    } else {
-        // Odd binary: small allocation for the folded vector.
-        // Odd sizes are rare in practice (only from partial binary reduction
-        // of 3^b residuals). The allocation is small (half+1 elements).
-        let half = size / 2;
-        let output_len = half + 1;
-        let mut folded = Vec::with_capacity(output_len);
-        for i in 0..half {
-            folded.push(evals[i] + (evals[half + i] - evals[i]) * r);
-        }
-        folded.push(evals[half + half] * r);
-        smooth_mle_inner(&folded, rest, challenge_offset + 1, ternary_start)
-    }
-}
-
 /// Computes eq(points, p) on the hypercube for all p ∈ {0,1}^k.
 pub fn eq_weights<F: Field>(point: &[F]) -> Vec<F> {
     let mut result = vec![F::ZERO; 1 << point.len()];
     eval_eq(&mut result, point, F::ONE);
     result
+}
+
+/// Computes fold weights for a vector of `size` after applying the mixed
+/// binary/ternary sumcheck fold schedule with the given `challenges`.
+///
+/// Returns a vector of length `size` such that
+/// `dot(mixed_fold_weights(c, N), v) == fold_all(v, c)` where `fold_all`
+/// uses `is_ternary_round(size)` dispatch at each step.
+///
+/// For pow2 `size` with all-binary schedule, this is equivalent to
+/// `eq_weights(challenges)` (same length, same values).
+pub fn mixed_fold_weights<F: Field>(challenges: &[F], size: usize) -> Vec<F> {
+    use crate::protocols::sumcheck::is_ternary_round;
+
+    if size == 0 {
+        return Vec::new();
+    }
+    if size == 1 || challenges.is_empty() {
+        return vec![F::ONE; size];
+    }
+
+    let c = challenges[0];
+    let rest = &challenges[1..];
+
+    if is_ternary_round(size) {
+        let t = size / 3;
+        let sub = mixed_fold_weights(rest, t);
+        let half_inv = F::from(2u64).inverse().expect("char != 2");
+        let two = F::from(2u64);
+        let l0 = (c - F::ONE) * (c - two) * half_inv;
+        let l1 = c * (two - c);
+        let l2 = c * (c - F::ONE) * half_inv;
+        let mut out = Vec::with_capacity(size);
+        for w in &sub {
+            out.push(l0 * *w);
+        }
+        for w in &sub {
+            out.push(l1 * *w);
+        }
+        for w in &sub {
+            out.push(l2 * *w);
+        }
+        out
+    } else {
+        // Binary (possibly odd size): out_len = (size+1)/2 = high_len.
+        let half = size / 2;
+        let high_len = size - half;
+        let sub = mixed_fold_weights(rest, high_len);
+        debug_assert_eq!(sub.len(), high_len);
+        let mut out = Vec::with_capacity(size);
+        // Positions 0..half: weight (1-c) * sub[k]
+        for k in 0..half {
+            out.push((F::ONE - c) * sub[k]);
+        }
+        // Positions half..2*half: weight c * sub[k]
+        for k in 0..half {
+            out.push(c * sub[k]);
+        }
+        // Odd tail position 2*half: weight c * sub[half]
+        if high_len > half {
+            out.push(c * sub[half]);
+        }
+        debug_assert_eq!(out.len(), size);
+        out
+    }
 }
 
 /// Accumulates a scaled evaluation of the equality function.
@@ -319,7 +336,6 @@ mod tests {
     fn test_smooth_multilinear_extend() {
         use crate::algebra::sumcheck::{fold, fold3};
         use crate::protocols::sumcheck::is_ternary_round;
-        use crate::smooth_domain::is_smooth;
 
         proptest!(|(seed: u64, length in 1_usize..300)| {
             let mut rng = StdRng::seed_from_u64(seed);
@@ -352,6 +368,42 @@ mod tests {
             // Test: smooth_multilinear_extend with ternary_start=0
             let actual = smooth_multilinear_extend(&vector, &point, 0);
             assert_eq!(actual, expected, "mismatch at length={length}");
+        });
+    }
+
+    #[test]
+    fn test_mixed_fold_weights_matches_dot_fold() {
+        use crate::algebra::{dot, sumcheck::{fold, fold3}};
+        use crate::protocols::sumcheck::is_ternary_round;
+
+        proptest!(|(seed: u64, length in 1_usize..300)| {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let vector: Vec<F> = random_vector(&mut rng, length);
+
+            // Determine schedule and pick challenges.
+            let mut num_rounds = 0;
+            let mut s = length;
+            while s > 1 {
+                if is_ternary_round(s) { s /= 3; } else { s = (s + 1) / 2; }
+                num_rounds += 1;
+            }
+            let challenges: Vec<F> = random_vector(&mut rng, num_rounds);
+
+            // Reference: fold in place.
+            let mut v = vector.clone();
+            let mut sz = v.len();
+            for &r in &challenges {
+                if is_ternary_round(sz) { fold3(&mut v, r); sz /= 3; }
+                else { fold(&mut v, r); sz = (sz + 1) / 2; }
+            }
+            assert_eq!(v.len(), 1);
+            let expected = v[0];
+
+            // Via weights.
+            let weights = mixed_fold_weights(&challenges, length);
+            assert_eq!(weights.len(), length);
+            let via_weights = dot(&weights, &vector);
+            assert_eq!(via_weights, expected, "mismatch at length={length}");
         });
     }
 

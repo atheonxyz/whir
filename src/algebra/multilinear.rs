@@ -160,27 +160,44 @@ pub fn mixed_multilinear_extend<M: Embedding>(
 /// `ternary_start`: index in `point` at which ternary rounds begin.
 /// Challenges before this index always use binary folding.
 pub fn smooth_multilinear_extend<F: Field>(evals: &[F], point: &[F], ternary_start: usize) -> F {
-    use crate::algebra::sumcheck::{fold, fold3};
-    use crate::protocols::sumcheck::is_ternary_round;
-
     if evals.is_empty() {
         return F::ZERO;
     }
     if evals.len() == 1 || point.is_empty() {
         return evals[0];
     }
-
     let mut w = evals.to_vec();
+    smooth_multilinear_extend_in_place(&mut w, point, ternary_start)
+}
+
+/// In-place variant of `smooth_multilinear_extend`. Consumes the caller's
+/// buffer and returns the final fold result — skips the `evals.to_vec()`
+/// clone, saving an O(N) allocation when the caller already owns the vector.
+pub fn smooth_multilinear_extend_in_place<F: Field>(
+    w: &mut Vec<F>,
+    point: &[F],
+    ternary_start: usize,
+) -> F {
+    use crate::algebra::sumcheck::{fold, fold3};
+    use crate::protocols::sumcheck::is_ternary_round;
+
+    if w.is_empty() {
+        return F::ZERO;
+    }
+    if w.len() == 1 || point.is_empty() {
+        return w[0];
+    }
+
     let mut size = w.len();
     for (i, &r) in point.iter().enumerate() {
         if size <= 1 {
             break;
         }
         if i >= ternary_start && is_ternary_round(size) {
-            fold3(&mut w, r);
+            fold3(w, r);
             size /= 3;
         } else {
-            fold(&mut w, r);
+            fold(w, r);
             size = (size + 1) / 2;
         }
     }

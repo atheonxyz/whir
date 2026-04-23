@@ -211,7 +211,7 @@ pub fn build_blinding_forms<'a, F: Field>(
 )]
 pub fn fold_weight_to_mask_size<F: Field>(
     weight: &dyn crate::algebra::linear_form::LinearForm<F>,
-    num_witness_variables: usize,
+    _num_witness_variables: usize,
     num_blinding_variables: usize,
 ) -> Covector<F> {
     use std::any::Any;
@@ -227,7 +227,14 @@ pub fn fold_weight_to_mask_size<F: Field>(
         owned = Covector::from(weight);
         &owned.vector
     };
-    debug_assert_eq!(vector.len(), 1usize << num_witness_variables);
+    // Weight length = witness domain size (pow2 or smooth-{2,3}); folding
+    // only needs the domain to be a multiple of the mask period.
+    debug_assert_eq!(
+        vector.len() % mask_size,
+        0,
+        "witness domain {} must be a multiple of mask size {mask_size}",
+        vector.len()
+    );
 
     fold_vector_to_mask_size(vector, mask_size)
 }

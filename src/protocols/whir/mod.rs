@@ -58,6 +58,171 @@ pub struct FinalClaim<F: Field> {
     /// Claimed value of the rlc of the mle of the linears forms in the point.
     /// Note: not computed on the prover side, set to zero instead.
     pub linear_form_rlc: F,
+    /// Index in `evaluation_point` where the final (ternary-enabled) sumcheck
+    /// challenges begin. Challenges before this use binary-only folding.
+    pub ternary_start: usize,
+    /// The initial vector size (needed to reconstruct the fold schedule).
+    pub initial_size: usize,
+}
+
+/// Compute the fold coefficient for a single position traced through all rounds.
+/// Uses binary-only folding schedule (for initial/mid-round constraints).
+///
+/// O(k) where k = challenges.len().
+///
+/// # Panics (debug only)
+/// Panics if `size` is divisible by 3 at any step, since this function
+/// only handles binary folding.
+fn fold_coeff<F: Field>(mut pos: usize, challenges: &[F], size: usize) -> F {
+    let mut coeff = F::ONE;
+    let mut s = size;
+    for &r in challenges {
+        if s <= 1 {
+            break;
+        }
+        debug_assert!(
+            s % 3 != 0 || s < 3,
+            "fold_coeff: binary-only but size {s} is divisible by 3"
+        );
+        let half = s / 2;
+        if pos < half {
+            coeff *= F::ONE - r;
+        } else {
+            coeff *= r;
+            pos -= half;
+        }
+        s = (s + 1) / 2;
+    }
+    coeff
+}
+
+/// Smooth tensor identity for `UnivariateEvaluation`.
+///
+/// Computes `Σ_{i=0}^{size-1} x^i · fold_eq(i, challenges, size)` using
+/// a mixed binary/ternary folding schedule.
+///
+/// `challenge_offset`: the global index of the first challenge in `challenges`.
+/// `ternary_start`: the global index where ternary-enabled folding begins.
+///
+/// Binary rounds use the recursive decomposition with odd-size correction.
+/// Ternary rounds use the degree-2 Lagrange factor.
+pub fn sum_x_fold_eq<F: Field>(
+    x: F,
+    challenges: &[F],
+    size: usize,
+    challenge_offset: usize,
+    ternary_start: usize,
+) -> F {
+    let half_inv = F::from(2u64).inverse().expect("char != 2");
+    let two = F::from(2u64);
+    sum_x_fold_eq_inner(
+        x,
+        challenges,
+        size,
+        challenge_offset,
+        ternary_start,
+        half_inv,
+        two,
+    )
+}
+
+fn sum_x_fold_eq_inner<F: Field>(
+    x: F,
+    challenges: &[F],
+    size: usize,
+    challenge_offset: usize,
+    ternary_start: usize,
+    half_inv: F,
+    two: F,
+) -> F {
+    use crate::protocols::sumcheck::is_ternary_round;
+
+    if size == 0 {
+        return F::ZERO;
+    }
+    if size == 1 || challenges.is_empty() {
+        return F::ONE;
+    }
+
+    let r = challenges[0];
+    let rest = &challenges[1..];
+    let is_tern = challenge_offset >= ternary_start && is_ternary_round(size);
+
+    if is_tern {
+        // Ternary round: factor = L₀(r) + L₁(r)·x^third + L₂(r)·x^{2·third}
+        let third = size / 3;
+        let x_third = x.pow([third as u64]);
+        let x_2third = x_third * x_third;
+        let l0 = (r - F::ONE) * (r - two) * half_inv;
+        let l1 = r * (two - r);
+        let l2 = r * (r - F::ONE) * half_inv;
+        let factor = l0 + l1 * x_third + l2 * x_2third;
+        let s_next = sum_x_fold_eq_inner(
+            x,
+            rest,
+            third,
+            challenge_offset + 1,
+            ternary_start,
+            half_inv,
+            two,
+        );
+        factor * s_next
+    } else {
+        // Binary round
+        let half = size / 2;
+        let next_size = (size + 1) / 2;
+        let x_half = x.pow([half as u64]);
+        let factor = (F::ONE - r) + r * x_half;
+        let s_next = sum_x_fold_eq_inner(
+            x,
+            rest,
+            next_size,
+            challenge_offset + 1,
+            ternary_start,
+            half_inv,
+            two,
+        );
+        let mut result = factor * s_next;
+
+        // Correction for odd sizes
+        if size % 2 == 1 {
+            let correction = fold_coeff(half, rest, next_size);
+            result -= (F::ONE - r) * x_half * correction;
+        }
+        result
+    }
+}
+
+/// Evaluate a linear form's MLE at a point, handling smooth-domain sizes.
+///
+/// For power-of-2 sizes, equivalent to `lf.mle_evaluate(point)`.
+/// For smooth sizes: uses `smooth_multilinear_extend` which recursively
+/// evaluates the MLE using the mixed binary/ternary fold schedule, avoiding
+/// any O(n) intermediate buffer allocation.
+pub fn fold_based_mle_evaluate<F: Field>(
+    lf: &dyn LinearForm<F>,
+    point: &[F],
+    smooth_size: usize,
+    ternary_start: usize,
+    _initial_size: usize,
+) -> F {
+    if smooth_size.is_power_of_two() {
+        return lf.mle_evaluate(point);
+    }
+
+    use crate::algebra::linear_form::Covector;
+    use crate::algebra::{smooth_multilinear_extend, smooth_multilinear_extend_in_place};
+    use std::any::Any;
+
+    // Fast path: if the linear form is a Covector, clone once then fold in-place.
+    if let Some(cov) = (lf as &dyn Any).downcast_ref::<Covector<F>>() {
+        return smooth_multilinear_extend(&cov.vector, point, ternary_start);
+    }
+
+    // General path: materialize into fresh Vec, fold in-place (skip redundant clone).
+    let mut w = vec![F::ZERO; smooth_size];
+    lf.accumulate(&mut w, F::ONE);
+    smooth_multilinear_extend_in_place(&mut w, point, ternary_start)
 }
 
 impl<F: Field> FinalClaim<F> {
@@ -66,7 +231,15 @@ impl<F: Field> FinalClaim<F> {
         linear_forms: impl IntoIterator<Item = &'a dyn LinearForm<F>>,
     ) -> VerificationResult<()> {
         let rlc = zip_strict(&self.rlc_coefficients, linear_forms)
-            .map(|(&c, l)| c * l.mle_evaluate(&self.evaluation_point))
+            .map(|(&c, l)| {
+                c * fold_based_mle_evaluate(
+                    l,
+                    &self.evaluation_point,
+                    l.size(),
+                    self.ternary_start,
+                    self.initial_size,
+                )
+            })
             .sum::<F>();
         verify!(rlc == self.linear_form_rlc);
         Ok(())
@@ -860,6 +1033,200 @@ mod tests {
             .unwrap()
             .verify(weights_dyn_refs)
             .unwrap();
+    }
+
+    /// Run a complete WHIR proof lifecycle for a smooth-{2,3} size.
+    fn make_smooth_whir_things(
+        size: usize,
+        initial_folding_factor: usize,
+        folding_factor: usize,
+        batch_size: usize,
+    ) {
+        let num_variables = if size <= 1 {
+            0
+        } else {
+            (usize::BITS - (size - 1).leading_zeros()) as usize
+        };
+
+        eprintln!("\n--- Smooth test: size={size}, ff={folding_factor}, vars={num_variables} ---");
+
+        let whir_params = ProtocolParameters {
+            security_level: 32,
+            pow_bits: 0,
+            initial_folding_factor,
+            folding_factor,
+            unique_decoding: false,
+            starting_log_inv_rate: 1,
+            batch_size,
+            hash_id: hash::SHA2,
+        };
+
+        let mut params = Config::new(size, &whir_params);
+        params.disable_pow();
+
+        let vectors: Vec<Vec<F>> = (0..batch_size)
+            .map(|_| random_vector(thread_rng(), size))
+            .collect();
+        let vec_refs = vectors.iter().map(|v| v.as_slice()).collect::<Vec<_>>();
+
+        let ds = DomainSeparator::protocol(&params)
+            .session(&format!("Test at {}:{}", file!(), line!()))
+            .instance(&Empty);
+
+        let mut prover_state = ProverState::new_std(&ds);
+        let batched_witness = params.commit(&mut prover_state, &vec_refs);
+
+        let mut linear_forms: Vec<Box<dyn Evaluate<Basefield<F>>>> = Vec::new();
+        linear_forms.push(Box::new(Covector {
+            vector: (0..size as u64).map(F::from).collect(),
+        }));
+        let values = linear_forms
+            .iter()
+            .flat_map(|lf| vec_refs.iter().map(|v| lf.evaluate(params.embedding(), v)))
+            .collect::<Vec<_>>();
+
+        // Build prove_linear_forms as Vec<Box<dyn LinearForm<F>>>
+        let prove_linear_forms: Vec<Box<dyn LinearForm<F>>> = vec![Box::new(Covector {
+            vector: (0..size as u64).map(F::from).collect(),
+        })];
+
+        let _ = params.prove(
+            &mut prover_state,
+            vectors
+                .iter()
+                .map(|v| Cow::Borrowed(v.as_slice()))
+                .collect(),
+            vec![Cow::Owned(batched_witness)],
+            prove_linear_forms,
+            Cow::Borrowed(values.as_slice()),
+        );
+
+        let proof = prover_state.proof();
+        let mut verifier_state = VerifierState::new_std(&ds, &proof);
+
+        let commitment = params.receive_commitment(&mut verifier_state).unwrap();
+        let weights_dyn_refs = linear_forms
+            .iter()
+            .map(|w| w.as_ref() as &dyn LinearForm<F>)
+            .collect::<Vec<_>>();
+        params
+            .verify(&mut verifier_state, &[&commitment], &values)
+            .unwrap()
+            .verify(weights_dyn_refs)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_whir_smooth_domain() {
+        // Test with smooth-{2,3} sizes: 3 * 2^a.
+        // Only 3^1 is valid on Goldilocks (Field64) because
+        // p-1 = 2^32 * 3 * 5 * ... has only one factor of 3.
+        // 3^2 (k=9) would require a field with 3^2 | (p-1), e.g. BN254.
+        for folding_factor in [2, 3] {
+            for a in folding_factor..=3 * folding_factor {
+                let size = 3 * (1 << a);
+                make_smooth_whir_things(size, folding_factor, folding_factor, 1);
+            }
+        }
+    }
+
+    /// Run a complete WHIR proof lifecycle for a smooth-{2,3} size on BN254.
+    /// BN254 has 3^2 | (p-1), so codeword lengths with 9 as a factor are valid,
+    /// exercising two radix-3 NTT rounds.
+    fn make_smooth_whir_things_bn254(
+        size: usize,
+        initial_folding_factor: usize,
+        folding_factor: usize,
+        batch_size: usize,
+    ) {
+        use crate::algebra::{embedding::Identity, fields::Field256};
+        type BF = Field256;
+
+        let num_variables = if size <= 1 {
+            0
+        } else {
+            (usize::BITS - (size - 1).leading_zeros()) as usize
+        };
+
+        eprintln!(
+            "\n--- Smooth BN254 test: size={size}, ff={folding_factor}, vars={num_variables} ---"
+        );
+
+        let whir_params = ProtocolParameters {
+            security_level: 32,
+            pow_bits: 0,
+            initial_folding_factor,
+            folding_factor,
+            unique_decoding: false,
+            starting_log_inv_rate: 1,
+            batch_size,
+            hash_id: hash::SHA2,
+        };
+
+        let mut params = Config::<Identity<BF>>::new(size, &whir_params);
+        params.disable_pow();
+
+        let vectors: Vec<Vec<BF>> = (0..batch_size)
+            .map(|_| random_vector(thread_rng(), size))
+            .collect();
+        let vec_refs = vectors.iter().map(|v| v.as_slice()).collect::<Vec<_>>();
+
+        let ds = DomainSeparator::protocol(&params)
+            .session(&format!("Test at {}:{}", file!(), line!()))
+            .instance(&Empty);
+
+        let mut prover_state = ProverState::new_std(&ds);
+        let batched_witness = params.commit(&mut prover_state, &vec_refs);
+
+        let mut linear_forms: Vec<Box<dyn Evaluate<Identity<BF>>>> = Vec::new();
+        linear_forms.push(Box::new(Covector {
+            vector: (0..size as u64).map(BF::from).collect(),
+        }));
+        let values = linear_forms
+            .iter()
+            .flat_map(|lf| vec_refs.iter().map(|v| lf.evaluate(params.embedding(), v)))
+            .collect::<Vec<_>>();
+
+        let prove_linear_forms: Vec<Box<dyn LinearForm<BF>>> = vec![Box::new(Covector {
+            vector: (0..size as u64).map(BF::from).collect(),
+        })];
+
+        let _ = params.prove(
+            &mut prover_state,
+            vectors
+                .iter()
+                .map(|v| Cow::Borrowed(v.as_slice()))
+                .collect(),
+            vec![Cow::Owned(batched_witness)],
+            prove_linear_forms,
+            Cow::Borrowed(values.as_slice()),
+        );
+
+        let proof = prover_state.proof();
+        let mut verifier_state = VerifierState::new_std(&ds, &proof);
+
+        let commitment = params.receive_commitment(&mut verifier_state).unwrap();
+        let weights_dyn_refs = linear_forms
+            .iter()
+            .map(|w| w.as_ref() as &dyn LinearForm<BF>)
+            .collect::<Vec<_>>();
+        params
+            .verify(&mut verifier_state, &[&commitment], &values)
+            .unwrap()
+            .verify(weights_dyn_refs)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_whir_smooth_domain_bn254() {
+        // BN254: 3^2 | (p-1), so sizes with 9 * 2^a work.
+        // This exercises TWO radix-3 NTT rounds in the codeword encoding.
+        for folding_factor in [2, 3] {
+            for a in folding_factor..=2 * folding_factor {
+                let size = 9 * (1 << a);
+                make_smooth_whir_things_bn254(size, folding_factor, folding_factor, 1);
+            }
+        }
     }
 
     #[test]

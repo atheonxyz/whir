@@ -10,14 +10,15 @@ use crate::{
     algebra::{
         dot,
         embedding::Embedding,
-        eq_weights, lift,
+        lift,
         linear_form::{Covector, Evaluate, LinearForm, UnivariateEvaluation},
-        mixed_scalar_mul_add,
-        sumcheck::fold,
-        tensor_product,
+        mixed_fold_weights, mixed_scalar_mul_add, tensor_product,
     },
     hash::Hash,
-    protocols::{geometric_challenge::geometric_challenge, irs_commit, whir::FinalClaim},
+    protocols::{
+        geometric_challenge::geometric_challenge, irs_commit, sumcheck::fold_mixed,
+        whir::FinalClaim,
+    },
     transcript::{
         codecs::U64, Codec, Decoding, DuplexSpongeInterface, ProverMessage, ProverState,
         VerifierMessage,
@@ -201,13 +202,14 @@ impl<M: Embedding> Config<M> {
             // There are no constraints yet, so we can skip the sumcheck.
             // (If we did run it, all sumcheck vectors would be constant zero)
             // TODO: Don't compute evaluations and constraints in the first place.
-            let folding_randomness = (0..self.initial_sumcheck.num_rounds)
+            let folding_randomness: Vec<M::Target> = (0..self.initial_sumcheck.num_rounds)
                 .map(|_| prover_state.verifier_message())
                 .collect();
             self.initial_skip_pow.prove(prover_state);
-            // Fold vector (initial sumcheck is binary-only)
+            // Fold vector using the initial sumcheck's (possibly mixed) schedule.
+            let mut sz = vector.len();
             for &f in &folding_randomness {
-                fold(&mut vector, f);
+                sz = fold_mixed(&mut vector, f, sz);
             }
             // Covector must be all zeros.
             covector = vec![M::Target::ZERO; self.initial_sumcheck.final_size()];
@@ -226,18 +228,21 @@ impl<M: Embedding> Config<M> {
             round_config.pow.prove(prover_state);
 
             // Open the previous round's witness.
-            let in_domain = match prev_witness {
+            let (in_domain, prev_interleaving_depth) = match prev_witness {
                 RoundWitness::Initial(init_witnesses) => {
                     let witness_refs: Vec<&_> = init_witnesses.iter().map(|c| &**c).collect();
-                    self.initial_committer
+                    let ind = self
+                        .initial_committer
                         .open(prover_state, &witness_refs)
-                        .lift(self.embedding())
+                        .lift(self.embedding());
+                    (ind, self.initial_committer.interleaving_depth)
                 }
                 RoundWitness::Round(old_witness) => {
                     let prev_round_config = &self.round_configs[round_index - 1];
-                    prev_round_config
+                    let ind = prev_round_config
                         .irs_committer
-                        .open(prover_state, &[&old_witness])
+                        .open(prover_state, &[&old_witness]);
+                    (ind, prev_round_config.irs_committer.interleaving_depth)
                 }
             };
 
@@ -252,7 +257,7 @@ impl<M: Embedding> Config<M> {
                 .values(&[M::Target::ONE])
                 .chain(in_domain.values(&tensor_product(
                     &vector_rlc_coeffs,
-                    &eq_weights(&folding_randomness),
+                    &mixed_fold_weights(&folding_randomness, prev_interleaving_depth),
                 )))
                 .collect::<Vec<_>>();
             let stir_rlc_coeffs = geometric_challenge(prover_state, stir_challenges.len());
@@ -300,8 +305,8 @@ impl<M: Embedding> Config<M> {
             }
         }
 
-        // Final sumcheck (uses mixed ternary/binary folding)
-        let ternary_start = evaluation_point.len();
+        // Ternary folds were done in the initial sumcheck, so the final
+        // sumcheck operates on a pure pow2 vector with binary-only folding.
         let final_folding_randomness = self
             .final_sumcheck
             .prove(prover_state, &mut vector, &mut covector, &mut the_sum, &[])
@@ -312,7 +317,8 @@ impl<M: Embedding> Config<M> {
             evaluation_point,
             rlc_coefficients: initial_forms_rlc_coeffs.to_vec(),
             linear_form_rlc: M::Target::ZERO,
-            ternary_start,
+            // Ternary folds live entirely in the initial sumcheck, starting at index 0.
+            ternary_start: 0,
             initial_size: self.initial_size(),
         }
     }

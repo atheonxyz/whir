@@ -7,9 +7,8 @@ use crate::{
     algebra::{
         dot,
         embedding::{Embedding, Identity},
-        eq_weights,
         linear_form::{Evaluate, LinearForm, MultilinearExtension},
-        tensor_product,
+        mixed_fold_weights, tensor_product,
     },
     hash::Hash,
     protocols::{geometric_challenge::geometric_challenge, irs_commit, whir::FinalClaim},
@@ -142,7 +141,7 @@ impl<M: Embedding> Config<M> {
             round_config.pow.verify(verifier_state)?;
 
             // Open the previous round's commitment, producing in-domain evaluations.
-            let (in_domain, poly_rlc) = match prev_commitment {
+            let (in_domain, poly_rlc, prev_interleaving_depth) = match prev_commitment {
                 RoundCommitment::Initial {
                     commitments,
                     batching_weights,
@@ -150,14 +149,22 @@ impl<M: Embedding> Config<M> {
                     let in_domain = self.initial_committer.verify(verifier_state, commitments)?;
                     // TODO: Skip lift and keep initial in-domain in subfield for evaluation.
                     // This should be every so slightly more performant.
-                    (in_domain.lift(self.embedding()), batching_weights)
+                    (
+                        in_domain.lift(self.embedding()),
+                        batching_weights,
+                        self.initial_committer.interleaving_depth,
+                    )
                 }
                 RoundCommitment::Round { commitment } => {
                     let prev_round_config = &self.round_configs[round_index - 1];
                     let in_domain = prev_round_config
                         .irs_committer
                         .verify(verifier_state, &[&commitment])?;
-                    (in_domain, vec![M::Target::ONE])
+                    (
+                        in_domain,
+                        vec![M::Target::ONE],
+                        prev_round_config.irs_committer.interleaving_depth,
+                    )
                 }
             };
 
@@ -172,7 +179,10 @@ impl<M: Embedding> Config<M> {
                 .values(&[M::Target::ONE])
                 .chain(in_domain.values(&tensor_product(
                     &poly_rlc,
-                    &eq_weights(round_folding_randomness.last().unwrap()),
+                    &mixed_fold_weights(
+                        round_folding_randomness.last().unwrap(),
+                        prev_interleaving_depth,
+                    ),
                 )))
                 .collect::<Vec<_>>();
             let constraint_rlc_coeffs =
@@ -197,20 +207,28 @@ impl<M: Embedding> Config<M> {
         self.final_pow.verify(verifier_state)?;
 
         // Open previous witness, as usual
-        let (in_domain, poly_rlc) = match prev_commitment {
+        let (in_domain, poly_rlc, prev_interleaving_depth) = match prev_commitment {
             RoundCommitment::Initial {
                 commitments,
                 batching_weights,
             } => {
                 let in_domain = self.initial_committer.verify(verifier_state, commitments)?;
-                (in_domain.lift(self.embedding()), batching_weights)
+                (
+                    in_domain.lift(self.embedding()),
+                    batching_weights,
+                    self.initial_committer.interleaving_depth,
+                )
             }
             RoundCommitment::Round { commitment } => {
                 let prev_round_config = &self.round_configs.last().unwrap();
                 let in_domain = prev_round_config
                     .irs_committer
                     .verify(verifier_state, &[&commitment])?;
-                (in_domain, vec![M::Target::ONE])
+                (
+                    in_domain,
+                    vec![M::Target::ONE],
+                    prev_round_config.irs_committer.interleaving_depth,
+                )
             }
         };
 
@@ -219,22 +237,22 @@ impl<M: Embedding> Config<M> {
             in_domain.evaluators(final_vector.len()),
             in_domain.values(&tensor_product(
                 &poly_rlc,
-                &eq_weights(round_folding_randomness.last().unwrap()),
+                &mixed_fold_weights(
+                    round_folding_randomness.last().unwrap(),
+                    prev_interleaving_depth,
+                ),
             )),
         ) {
             verify!(weights.evaluate(&Identity::<M::Target>::new(), &final_vector) == evals);
         }
 
-        // Final sumcheck (uses mixed ternary/binary folding)
+        // Ternary folds happen in the initial sumcheck, so the final sumcheck
+        // is pure binary over pow2 sizes.
         let final_sumcheck_randomness = self.final_sumcheck.verify(verifier_state, &mut the_sum)?.0;
         round_folding_randomness.push(final_sumcheck_randomness.clone());
 
-        // Compute folding randomness across all rounds
-        let ternary_start = round_folding_randomness
-            .iter()
-            .take(round_folding_randomness.len().saturating_sub(1))
-            .map(|v| v.len())
-            .sum::<usize>();
+        // Ternary folds live entirely in the initial sumcheck, starting at index 0.
+        let ternary_start = 0usize;
         let evaluation_point = round_folding_randomness
             .into_iter()
             .flat_map(|poly| poly.into_iter())

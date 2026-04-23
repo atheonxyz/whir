@@ -160,9 +160,9 @@ impl<M: Embedding> Config<M> {
                 round_pow: pow(starting_folding_pow_bits),
                 num_rounds: initial_num_rounds,
                 mask_length: 0,
-                // Strategy A: ternary folds happen entirely within the initial
-                // sumcheck. After it, `current_size` is pure pow2 and all
-                // downstream rounds take the radix-2 / eq_weights fast paths.
+                // Ternary folds happen entirely within the initial sumcheck when
+                // b > 0. After it, `current_size` is pure pow2 and downstream
+                // rounds take the radix-2 / eq_weights fast paths.
                 ternary: b > 0,
             },
             initial_skip_pow: pow(initial_skip_pow_bits),

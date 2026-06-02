@@ -1,6 +1,6 @@
 use ark_ff::{
-    Field, Fp128, Fp192, Fp2, Fp256, Fp2Config, Fp3, Fp3Config, Fp64, MontBackend, MontConfig,
-    MontFp, PrimeField,
+    Field, Fp128, Fp192, Fp2, Fp2Config, Fp3, Fp3Config, Fp64, MontBackend, MontConfig, MontFp,
+    PrimeField,
 };
 use serde::{Deserialize, Serialize};
 use zerocopy::IntoBytes;
@@ -62,13 +62,7 @@ impl<F: Field> TypeInfo for F {
     }
 }
 
-#[derive(MontConfig)]
-#[modulus = "21888242871839275222246405745257275088548364400416034343698204186575808495617"]
-#[generator = "5"]
-#[small_subgroup_base = "3"]
-#[small_subgroup_power = "2"]
-pub struct BN254Config;
-pub type Field256 = Fp256<MontBackend<BN254Config, 4>>;
+pub use ark_bn254::Fr as Field256;
 
 #[derive(MontConfig)]
 #[modulus = "3801539170989320091464968600173246866371124347557388484609"]

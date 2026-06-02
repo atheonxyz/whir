@@ -35,6 +35,7 @@ redundant_closure_for_method_calls = "allow"
 [dependencies]
 ark-std = { version = "0.5", features = ["std"] }
 ark-ff = { version = "0.5", features = ["asm", "std"] }
+ark-bn254 = { version = "0.5", default-features = false, features = ["curve"] }
 ark-serialize = "0.5"
 blake3 = { version = "1.5", features = ["digest", "traits-preview"] }
 sha3 = { version = "0.10.7", features = ["asm", "oid"] }
